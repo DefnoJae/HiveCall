@@ -18,9 +18,9 @@
   /* ======================= Supabase + PeerJS setup ======================= */
   /* Required (already provisioned, per the agreed schema):
        servers(id, name, owner_id, invite_code)
-       server_members(server_id, user_id)  â€” composite PK (server_id, user_id)
+       server_members(server_id, user_id)  — composite PK (server_id, user_id)
        messages(id, server_id, user_id, user_name, user_color, content, created_at)
-       call_presence(server_id, active_users jsonb)  â€” one row per server; keeps the roster + "_music"
+       call_presence(server_id, active_users jsonb)  — one row per server; keeps the roster + "_music"
        soundboard(id, server_id, user_id, name, emoji, data_url, created_at)
      Display names/colors come from auth.users user_metadata (display_name, color)
      and from the user_name/user_color columns on messages + call_presence roster.
@@ -33,7 +33,7 @@
     ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
     : null;
 
-  /* Optimistic runtime mirrors â€” filled from Supabase by refreshData().
+  /* Optimistic runtime mirrors — filled from Supabase by refreshData().
      guilds() = servers keyed by id (with .members/.call/.chat mirrors),
      users()  = profiles (name/color) keyed by Supabase user id. */
   let DB = { servers: {}, profiles: {}, soundboards: {} };
@@ -206,6 +206,8 @@
     ch.on("postgres_changes", { event: "*", schema: "public", table: "soundboard", filter: "server_id=eq." + gid },
       payload => onSoundboardRealtime(payload));
     ch.on("broadcast", { event: "sb_play" }, p => onSbPlay(p));
+    ch.on("broadcast", { event: "wreg" }, p => onRenegotiation(p));
+    ch.on("broadcast", { event: "typing" }, p => onTyping(p));
     ch.on("broadcast", { event: "kick" }, p => { if (S.call && S.call.guildId === gid && p.userId && p.userId === S.user.id) { toast("You were disconnected by a server member.", "err"); leaveCall(); } });
     ch.on("broadcast", { event: "invite" }, p => {
       if (!p || !p.from || p.from === S.user.id) return;
@@ -354,7 +356,7 @@
     u = String(u || "");
     const i = u.indexOf("?");
     const core = i === -1 ? u : u.slice(0, i);
-    return u.length > 160 ? core.slice(0, 120) + "â€¦" : u;
+    return u.length > 160 ? core.slice(0, 120) + "…" : u;
   };
   const fmtLogArg = (x) => x instanceof Error ? (x.stack || x.message) : (x && typeof x === "object" ? (() => { try { return JSON.stringify(x); } catch (_) { return String(x); } })() : String(x));
   function logPlayer(level, msg) {
@@ -401,7 +403,7 @@
   function boot() {
     // Force resolvers to be considered "down" on first load so every track
     // plays instantly via YouTube IFrame. Re-enable probing with the
-    // "â†» Retry resolvers now" button in the Playback Logs panel.
+    // "↻ Retry resolvers now" button in the Playback Logs panel.
     if (localStorage.getItem(RESOLVER_CACHE_KEY) === null) markResolverDown();
     if (!supabaseClient) { renderConfigError(); return; }
     document.addEventListener("keydown", e => { if (e.key === "Escape" && S.modalOpen) closeModal(); });
@@ -464,7 +466,7 @@
           '<p>Create an account, spin up a server with a randomly assigned name, and see who is already in the call before you jump in. Pick a server, join voice, go.</p>' +
           '<div class="brand-steps">' +
             '<div class="brand-step"><span class="num">1</span><span>Create an account and your very first server is made for you.</span></div>' +
-            '<div class="brand-step"><span class="num">2</span><span>See who is in the voice call before joining â€” mic, camera, screenshare at your fingertips.</span></div>' +
+            '<div class="brand-step"><span class="num">2</span><span>See who is in the voice call before joining — mic, camera, screenshare at your fingertips.</span></div>' +
             '<div class="brand-step"><span class="num">3</span><span>Hand out your invite code so friends can join or leave the call freely.</span></div>' +
           '</div></div>' +
           '<div class="brand-foot"><span>Server name <b>renamable any time</b></span><span>Invite codes</span><span>Group calls</span></div>' +
@@ -492,7 +494,7 @@
         '<div class="field"><label>Password</label><input id="au-pass" type="password" placeholder="6+ characters"></div>' +
         '<div class="field"><label>Avatar color</label><div class="swatch-row" id="au-colors">' + swatchesHTML(COLORS[5]) + '</div></div>' +
         '<div class="auth-error" id="auth-err"></div>' +
-        '<button class="btn btn-primary" id="auth-go">Create account  â†’</button>' +
+        '<button class="btn btn-primary" id="auth-go">Create account  →</button>' +
         '<p class="field"><span class="hint">A server with a random name is created for you automatically. Share its invite code so real friends can join and hop into the call.</span></p>';
     } else {
       f.innerHTML =
@@ -501,7 +503,7 @@
         '<div class="field"><label>Email</label><input id="au-email" type="email" autocomplete="email" placeholder="you@example.com"></div>' +
         '<div class="field"><label>Password</label><input id="au-pass" type="password"></div>' +
         '<div class="auth-error" id="auth-err"></div>' +
-        '<button class="btn btn-primary" id="auth-go">Sign in  â†’</button>';
+        '<button class="btn btn-primary" id="auth-go">Sign in  →</button>';
     }
     if (mode === "signup") {
       let chosen = COLORS[5];
@@ -544,7 +546,7 @@
       goHome();
       toast("Welcome to HiveCall, " + name + "!", "ok");
     } else {
-      // Email confirmation enabled in Supabase â€” ask the user to confirm.
+      // Email confirmation enabled in Supabase — ask the user to confirm.
       byId("auth-form").innerHTML =
         '<h2>Check your email</h2>' +
         '<p class="sub">We sent a confirmation link to <b>' + esc(email) + '</b>. Confirm it, then sign in.</p>' +
@@ -559,7 +561,7 @@
     if (!email || !pass) return authError("Enter your email and password.");
     const { error } = await supabaseClient.auth.signInWithPassword({ email, password: pass });
     if (error) return authError(error.message);
-    // onAuthStateChange(SIGNED_IN) â†’ refreshAndGo â†’ goHome
+    // onAuthStateChange(SIGNED_IN) → refreshAndGo → goHome
     toast("Signed in.", "ok");
   }
 
@@ -654,9 +656,7 @@
   }
 
   /* ======================= home ======================= */
-  async function goHome() {
-    if (callTimerI) { clearInterval(callTimerI); callTimerI = null; }
-    await refreshData();
+  function renderHomeShell() {
     const joined = Object.values(guilds());
     if (S.activeGuildId && !guilds()[S.activeGuildId]) S.activeGuildId = null;
     if (!S.activeGuildId && joined.length) S.activeGuildId = joined[0].id;
@@ -671,6 +671,16 @@
     renderRail();
     renderSidebar();
     renderContent();
+  }
+  let homeSeq = 0;
+  async function goHome(refresh = true) {
+    if (callTimerI) { clearInterval(callTimerI); callTimerI = null; }
+    const seq = ++homeSeq;
+    renderHomeShell();
+    if (refresh && seq === homeSeq && supabaseClient && S.user) {
+      await refreshData();
+      if (seq === homeSeq) renderHomeShell();
+    }
   }
 
   function renderRail() {
@@ -716,7 +726,7 @@
         '<div class="channel voice ' + (S.activeChannel === "voice" ? "active" : "") + '" data-channel="voice">' + ic("voice", 16) + "<span>Voice Lounge</span>" +
           '<span class="count">' + (inCall ? '<span class="livectl"><span class="live-dot"></span><span id="side-call-n">' + inCall + "</span></span>" : "<span>" + inCall + "</span>") + "</span></div>" +
         '<div class="sidebar-section">' +
-          '<div class="channel-label">IN THIS SERVER â€” ' + g.members.length + "</div>" +
+          '<div class="channel-label">IN THIS SERVER — ' + g.members.length + "</div>" +
           '<p class="ill-hint" style="padding:0 6px;">The member list on the right shows who is in the voice call before you join.</p>' +
         "</div>" +
       "</div>";
@@ -754,10 +764,10 @@
       return '<div class="invite-row" style="border:1px solid var(--line-2);border-radius:12px;margin-bottom:10px;">' +
         '<div class="avatar" style="width:46px;height:46px;border-radius:14px;background:linear-gradient(145deg,' + g.color + ',#050506);font-size:15px;">' + esc(shortName(g.name)) + "</div>" +
         '<div class="ir-info"><div class="ir-name">' + esc(g.name) + "</div>" +
-        '<div class="ir-status">' + g.members.length + " members Â· " + (inCall ? '<span style="color:var(--green)">' + inCall + " in the call</span>" : "nobody in the call yet") + "</div></div>" +
+        '<div class="ir-status">' + g.members.length + " members · " + (inCall ? '<span style="color:var(--green)">' + inCall + " in the call</span>" : "nobody in the call yet") + "</div></div>" +
         '<div class="ir-actions"><button class="ir-action gray" data-ocode="' + g.invite + '">' + ic("copy", 13) + "</button>" +
         '<button class="ir-action add" data-open="' + g.id + '">Open</button></div></div>';
-    }).join("") : '<div class="invite-row" style="border:1px dashed var(--line-2);border-radius:12px;"><div class="ir-info"><div class="ir-name" style="color:var(--tx-3);font-weight:600;">No servers yet</div><div class="ir-status">Create one â€” it gets a random name you can change later.</div></div></div>';
+    }).join("") : '<div class="invite-row" style="border:1px dashed var(--line-2);border-radius:12px;"><div class="ir-info"><div class="ir-name" style="color:var(--tx-3);font-weight:600;">No servers yet</div><div class="ir-status">Create one — it gets a random name you can change later.</div></div></div>';
     return '<div class="voice-wrap"><div class="voice-card" style="max-width:560px;text-align:left;align-items:flex-start;">' +
       '<h1>Your servers</h1><p class="vsub" style="margin:8px 0 22px;">Join a server to see who is already in the call, then hop in.</p>' +
       cards +
@@ -790,15 +800,30 @@
     const msgs = (g.chat || []).map(m => chatRowHTML(m)).join("");
     return '<div class="chat-head">' + ic("hash", 18) + "<span>general</span></div>" +
       '<div class="chat-msgs" id="chat-msgs">' + (msgs || '<p class="ill-hint">No messages yet. Say hi!</p>') + "</div>" +
+      '<div class="typing" id="typing" style="display:none;color:var(--tx-3);font-size:12px;line-height:1;padding:7px 4px 9px;"></div>' +
       '<div class="chat-comp"><div class="inner"><input id="chat-in" placeholder="Message #general" autocomplete="off"><button class="send" id="chat-send">' + ic("send", 18) + "</button></div></div>";
   }
   function wireChat(g) {
     const sc = byId("chat-msgs"); if (sc) sc.scrollTop = sc.scrollHeight;
     const input = byId("chat-in");
     input.focus();
+    const emitTyping = stopped => {
+      const ch = getChannel(g.id);
+      if (!ch) return;
+      try { ch.send({ type: "broadcast", event: "typing", payload: { from: S.user.id, guildId: g.id, stopped: !!stopped } }); } catch (e) {}
+    };
+    let typT = null;
+    input.addEventListener("input", () => {
+      if (!input.value.trim()) { emitTyping(true); return; }
+      clearTimeout(typT);
+      typT = setTimeout(() => typLastSent = 0, 2200);
+      if (!typLastSent || Date.now() - typLastSent > 2500) { typLastSent = Date.now(); emitTyping(false); }
+    });
+    input.addEventListener("blur", () => { clearTimeout(typT); emitTyping(true); });
     const send = async () => {
       const text = input.value.trim();
       if (!text || !supabaseClient) return;
+      clearTimeout(typT); typLastSent = 0; emitTyping(true);
 const me = S.user;
     // Optimistic local append; realtime echo is deduped by id.
     const m = { id: "m_" + Date.now(), authorId: me.id, authorName: me.name, authorColor: me.color, text, at: Date.now() };
@@ -820,6 +845,44 @@ const me = S.user;
     input.addEventListener("keydown", e => { if (e.key === "Enter") send(); });
   }
 
+  /* ---------- typing indicators (broadcast "typing" + 2.5s throttle, 4s expiry) ---------- */
+  let typers = {}, typLastSent = 0, typTimer = null;
+  function typingHTML() {
+    const me = (S.user && S.user.id) || "";
+    const names = Object.keys(typers)
+      .filter(uid => uid !== me && Date.now() - typers[uid] <= 4000)
+      .map(uid => { const u = users()[uid]; return (u && u.name) || uid; });
+    if (!names.length) return "";
+    const list = names.length <= 2 ? names.join(" and ") : names.slice(0, 2).join(", ") + " and " + (names.length - 2) + " other" + (names.length === 3 ? "" : "s");
+    return esc(list) + " " + (names.length > 1 ? "are" : "is") + " typing…";
+  }
+  function sweepTypers() {
+    const now = Date.now();
+    Object.keys(typers).forEach(uid => { if (now - typers[uid] > 4000) delete typers[uid]; });
+    renderTyping();
+    if (!Object.keys(typers).length) { clearTimeout(typTimer); typTimer = null; }
+  }
+  function renderTyping() {
+    const el = byId("typing");
+    if (!el) return;
+    const html = typingHTML();
+    if (html) { el.style.display = ""; el.innerHTML = html; }
+    else { el.style.display = "none"; el.innerHTML = ""; }
+  }
+  function onTyping(p) {
+    const me = (S.user && S.user.id) || "";
+    if (!p || !p.from || p.from === me) return;
+    if (p.stopped) {
+      delete typers[p.from];
+      if (!Object.keys(typers).length) { clearTimeout(typTimer); typTimer = null; }
+    } else {
+      typers[p.from] = Date.now();
+      clearTimeout(typTimer);
+      typTimer = setTimeout(sweepTypers, 4000);
+    }
+    renderTyping();
+  }
+
   function voiceHTML(g) {
     const inCallIds = g.call || [];
     const inCallUsers = inCallIds.map(id => users()[id]).filter(Boolean);
@@ -829,11 +892,11 @@ const me = S.user;
           const self = u.id === S.user.id;
           return '<span class="chip"><span class="avatar" style="width:26px;height:26px;background:' + u.color + '">' + esc(initials(u.name)) + '</span><span>' + (self ? "You" : esc(u.name)) + "</span>" + (self ? "" : '<span class="speak">' + ic("headphone", 13) + "</span>") + "</span>";
         }).join("")
-      : '<span class="chip empty">The call is empty â€” be the first to join</span>';
+      : '<span class="chip empty">The call is empty — be the first to join</span>';
     return '<div class="voice-wrap"><div class="voice-card">' +
       '<div class="voice-hero ' + (inCallUsers.length ? "live" : "idle") + '">' + (inCallUsers.length ? ic("headphone", 42) : ic("voice", 42)) + "</div>" +
       "<h1>Voice Lounge</h1>" +
-      '<p class="vsub">' + esc(g.name) + " Â· a place to hang out. Everyone on the server can see who is in this call before joining." + "</p>" +
+      '<p class="vsub">' + esc(g.name) + " · a place to hang out. Everyone on the server can see who is in this call before joining." + "</p>" +
       '<div class="voice-status">' + (inCallUsers.length ? '<span class="live-dot"></span>' : ic("users", 15)) +
         "<span>" + inCallUsers.length + " voice participant" + (inCallUsers.length === 1 ? "" : "s") + "</span></div>" +
       '<div class="voice-people">' + chips + "</div>" +
@@ -844,7 +907,7 @@ const me = S.user;
           : '<button class="btn btn-green" id="v-join">' + ic("voice", 17) + " Join call</button>") +
         '<button class="btn btn-ghost" id="v-invite">' + ic("userPlus", 17) + " Invite</button>" +
       "</div>" +
-      '<div class="voice-note">' + ic("info", 13) + " A camera &amp; microphone request appears when you join â€” decline and you still join with your avatar.</div>" +
+      '<div class="voice-note">' + ic("info", 13) + " A camera &amp; microphone request appears when you join — decline and you still join with your avatar.</div>" +
     "</div></div>";
   }
   function wireVoice(g) {
@@ -865,9 +928,9 @@ const me = S.user;
         '<span class="mname" style="' + (self ? "color:#fff;" : "") + '">' + esc(u.name) + (self ? ' <span class="mtag">(you)</span>' : "") + "</span>" +
         "</div>";
     };
-    let html = '<div class="members-group">In the call â€” ' + inCall.length + "</div>"
+    let html = '<div class="members-group">In the call — ' + inCall.length + "</div>"
       + (inCall.length ? inCall.map(u => '<div class="member-row"><div class="a-wrap"><div class="avatar" style="width:30px;height:30px;background:' + u.color + '">' + esc(initials(u.name)) + '</div><div class="status-dot"></div></div><span class="mname">' + esc(u.name) + (u.id === S.user.id ? ' <span class="mtag">(you)</span>' : "") + '</span><span class="in-call-badge" title="In the voice call">' + ic("headphone", 14) + "</span></div>").join("") : '<p class="ill-hint" style="padding:0 8px 8px;">No one is in the call right now.</p>');
-    html += '<div class="members-group">In the server â€” ' + rest.length + "</div>"
+    html += '<div class="members-group">In the server — ' + rest.length + "</div>"
       + (rest.length ? rest.map(row).join("") : '<p class="ill-hint" style="padding:0 8px;">Only the people above make up this server.</p>');
     return html;
   }
@@ -894,7 +957,7 @@ const me = S.user;
     bootMedia();
     startCallTimer();
     playChime();
-    toast("Joined " + g.name + " Â· Voice Lounge", "ok");
+    toast("Joined " + g.name + " · Voice Lounge", "ok");
   }
 
   function leaveCall() {
@@ -925,7 +988,7 @@ const me = S.user;
   let peer = null, peerOpen = false, peerError = false;
   function getPeer() {
     if (typeof window.Peer === "undefined") {
-      if (!peerError) { peerError = true; toast("PeerJS network is ready in the <head> tag â€” it seems to be missing.", "err"); }
+      if (!peerError) { peerError = true; toast("PeerJS network is ready in the <head> tag — it seems to be missing.", "err"); }
       return null;
     }
     if (peer && !peer.destroyed) return peer;
@@ -1018,7 +1081,7 @@ const me = S.user;
       '<div class="call" id="call-view">' +
         '<div class="call-top">' +
           '<div class="call-left"><span class="pi-tag live"><span class="live-dot"></span>LIVE</span>' +
-          '<span class="sname">' + esc(g ? g.name : "Server") + "</span><span class=\"cname\">Â· Voice Lounge</span></div>" +
+          '<span class="sname">' + esc(g ? g.name : "Server") + "</span><span class=\"cname\">· Voice Lounge</span></div>" +
           '<div class="call-right">' +
             '<span class="pi-tag">' + ic("clock", 13) + '<span id="call-timer">00:00</span></span>' +
             '<span class="pi-tag">' + ic("users", 14) + ' <span id="call-count">1</span></span>' +
@@ -1137,7 +1200,7 @@ const me = S.user;
     } else {
       // Remote tile always keeps its avatar fill; the per-user <video> sits on
       // top and is revealed only when their actual WebRTC video track arrives.
-      body = fill + '<video id="vm-' + id + '" autoplay playsinline muted hidden></video>';
+      body = fill + '<video id="vm-' + id + '" autoplay playsinline hidden></video>';
     }
     return '<div class="tile' + (self ? '' : '') + '"' + (self ? ' id="tile-self"' : ' id="tile-' + id + '"') + '">' +
       body +
@@ -1164,12 +1227,12 @@ const me = S.user;
       '<div class="tile-fill"><div style="text-align:center;color:#c9cdd3;">' +
         '<div class="pres-art"><i></i><i></i><i></i><i></i></div>' +
         '<div style="margin-top:16px;font-weight:800;font-size:18px;color:#fff;">' + esc(label || "Screen share") + '</div>' +
-        '<div style="font-size:13px;color:#8b8f97;margin-top:4px;">Waiting for the presentation streamâ€¦</div>' +
+        '<div style="font-size:13px;color:#8b8f97;margin-top:4px;">Waiting for the presentation stream…</div>' +
       "</div></div>";
     return '<div class="tile share-tile pres">' +
       (stream ? '<video id="share-video" autoplay playsinline></video>' : art) +
       '<div class="sharing-badge">' + ic("share", 13) + " LIVE</div>" +
-      '<div class="tile-tag"><span class="mic-badge on">' + ic("share", 13) + '</span><span>Screen Â· ' + esc(label) + "</span></div>" +
+      '<div class="tile-tag"><span class="mic-badge on">' + ic("share", 13) + '</span><span>Screen · ' + esc(label) + "</span></div>" +
     "</div>";
   }
 
@@ -1246,6 +1309,7 @@ const me = S.user;
     if (cur.cam) {
       cur.cam = false;
       if (cur.stream) cur.stream.getVideoTracks().forEach(t => { t.enabled = false; try { cur.stream.removeTrack(t); t.stop(); } catch (e) {} });
+      renegotiateCamOff();
       updateCtl(); updateStage();
       pushPresence();
       toast("Camera off", "info");
@@ -1254,6 +1318,7 @@ const me = S.user;
     if (cur.stream && cur.stream.getVideoTracks().length) {
       cur.cam = true;
       cur.stream.getVideoTracks().forEach(t => t.enabled = true);
+      renegotiateCamOn();
       updateCtl(); updateStage();
       pushPresence();
       toast("Camera on", "info");
@@ -1268,12 +1333,98 @@ const me = S.user;
       if (cur.stream) vs.getVideoTracks().forEach(t => cur.stream.addTrack(t));
       else cur.stream = vs;
       cur.cam = true;
+      renegotiateCamOn();
       updateStage(); updateCtl();
       pushPresence();
       toast("Camera on", "ok");
     } catch (err) {
       toast("Camera access denied.", "err");
     }
+  }
+
+  /* ---------- mid-call camera renegotiation (PeerJS has no auto-renegotiate) ---------- */
+  function openPeers() {
+    const c = S.call; if (!c) return [];
+    const out = [];
+    Object.keys(c.peers || {}).forEach(uid => {
+      const mc = c.peers[uid];
+      if (mc && mc.open && mc.peerConnection) out.push(uid);
+    });
+    return out;
+  }
+  function renegotiateCamOn() {
+    const c = S.call; if (!c || !c.stream) return;
+    const vt = c.stream.getVideoTracks()[0];
+    openPeers().forEach(uid => {
+      if (!vt) return;
+      const mc = c.peers[uid];
+      try { mc.peerConnection.addTrack(vt, c.stream); } catch (e) { }
+    });
+    openPeers().forEach(uid => sendRenegotiation(uid));
+  }
+  function renegotiateCamOff() {
+    const c = S.call; if (!c) return;
+    openPeers().forEach(uid => {
+      const mc = c.peers[uid];
+      try {
+        mc.peerConnection.getSenders().forEach(s => { if (s.track && s.track.kind === "video") mc.peerConnection.removeTrack(s); });
+      } catch (e) { }
+    });
+    openPeers().forEach(uid => sendRenegotiation(uid));
+  }
+  function sendRenegotiation(uid) {
+    const c = S.call; if (!c) return;
+    const mc = c.peers[uid];
+    if (!mc || !mc.peerConnection || mc.peerConnection.signalingState !== "stable") return;
+    const pc = mc.peerConnection;
+    pc.createOffer()
+      .then(offer => pc.setLocalDescription(offer))
+      .then(() => {
+        const ch = getChannel(c.guildId);
+        if (!ch) return;
+        try { ch.send({ type: "broadcast", event: "wreg", payload: { from: S.user.id, to: uid, sdp: pc.localDescription || null } }); } catch (e) {}
+      })
+      .catch(e => console.warn("cam renegotiation offer failed", uid, e));
+  }
+  function onRenegotiation(p) {
+    const c = S.call;
+    if (!p || !p.sdp || !p.sdp.type || !c) return;
+    if (p.from && p.from === S.user.id) return;
+    if (p.to && p.to !== S.user.id) return;
+    const uid = p.from;
+    const mc = c.peers[uid];
+    if (!mc || !mc.peerConnection) return;
+    const pc = mc.peerConnection;
+    const handle = () => syncRemoteFromMC(uid);
+    if (p.sdp.type === "offer") {
+      pc.setRemoteDescription(p.sdp)
+        .then(() => pc.createAnswer())
+        .then(a => pc.setLocalDescription(a))
+        .then(() => {
+          const ch = getChannel(c.guildId);
+          if (ch) { try { ch.send({ type: "broadcast", event: "wreg", payload: { from: S.user.id, to: uid, sdp: pc.localDescription || null } }); } catch (e) {} }
+        })
+        .then(handle)
+        .catch(e => console.warn("cam renegotiation answer failed", uid, e));
+    } else {
+      pc.setRemoteDescription(p.sdp).then(handle).catch(e => console.warn("cam renegotiation apply failed", uid, e));
+    }
+  }
+  function syncRemoteFromMC(uid) {
+    const c = S.call;
+    if (!c) return;
+    const mc = c.peers[uid], r = c.remote[uid];
+    if (!mc || !mc.peerConnection || !r) return;
+    let hasVideo = false, hasAudio = false;
+    try {
+      mc.peerConnection.getReceivers().forEach(x => {
+        if (x.track && x.track.kind === "video" && x.track.readyState !== "ended") hasVideo = true;
+        if (x.track && x.track.kind === "audio" && x.track.readyState !== "ended") hasAudio = true;
+      });
+    } catch (e) {}
+    const changed = r.video !== hasVideo || r.audio !== hasAudio;
+    r.video = hasVideo; r.audio = hasAudio;
+    if (changed) updateStage();
   }
 
   async function toggleShare() {
@@ -1374,7 +1525,7 @@ const me = S.user;
   /* ======================= SOUND BOARD ======================= */
   let SB = { open: false, vol: 0.8 };
   const _sbAudio = [];
-  const SB_EMOJIS = ["ðŸ””", "ðŸ˜‚", "ðŸ˜€", "ðŸš¨", "ðŸ’¥", "ðŸ¸", "ðŸŽ‰", "ðŸ˜®", "ðŸ‘", "ðŸ¶", "ðŸ”¥", "ðŸ«¡", "ðŸ¤–", "ðŸ’¨", "ðŸŽ¯", "ðŸ•", "ðŸ’€", "ðŸ˜±"];
+  const SB_EMOJIS = ["🔊", "😂", "😎", "🚨", "💥", "🐷", "🎉", "😲", "👤", "🐕", "🔥", "🪄", "🤖", "💨", "🎯", "🍿", "💀", "😱"];
   const sbList = () => (S.call && DB.soundboards) ? (DB.soundboards[S.call.guildId] || []) : [];
   function sbAllInCall() { return sbList(); }
   function sbPlay(audioUrl) {
@@ -1396,7 +1547,7 @@ const me = S.user;
       try { ch.send({ type: "broadcast", event: "sb_play", payload: { id: s.id, name: s.name, emoji: s.emoji, dataUrl: s.dataUrl, player: S.user.id } }); } catch (e) {}
     }
     const me = users()[S.user.id];
-    toast((s.emoji || "ðŸ””") + " " + s.name + " â€” played by " + (me ? me.name : "someone"), "info");
+    toast((s.emoji || "🔊") + " " + s.name + " — played by " + (me ? me.name : "someone"), "info");
   }
   function onSbPlay(p) {
     if (!S.call || !p) return;
@@ -1440,7 +1591,7 @@ const me = S.user;
       const owner = users()[s.addedBy];
       const mine = s.addedBy === S.user.id;
       return '<div class="sb-row">' +
-        '<span class="sb-emoji">' + esc(s.emoji || "ðŸ””") + "</span>" +
+        '<span class="sb-emoji">' + esc(s.emoji || "🔊") + "</span>" +
         '<span class="sb-info"><span class="sb-name">' + esc(s.name) + '</span>' +
         '<span class="sb-by">by ' + esc(owner ? owner.name : "someone") + "</span></span>" +
         '<button class="sb-act" data-play="' + s.id + '" title="Play to the call">' + ic("sound", 15) + "</button>" +
@@ -1493,10 +1644,10 @@ const me = S.user;
       '<div class="modal" style="width:460px;">' +
         '<div class="modal-head"><h3>' + ic("sound", 17) + " Add a sound</h3><button class=\"modal-x\" data-close>" + ic("x", 16) + "</button></div>" +
         '<div class="modal-body">' +
-          '<div class="field"><label>Sound file</label><input type="file" id="sb-file" accept="audio/*">' +
-            '<div class="hint">MP3 / WAV / OGG. Keep it under ~1MB â€” sounds are stored in your server.</div></div>' +
+          '<div class="field"><label>Sound file</label><input type="file" id="sb-file" accept="audio/wav,audio/x-wav,audio/mp3,audio/mpeg,audio/ogg,audio/oga,audio/webm,audio/mp4,audio/x-m4a,audio/aac,audio/flac">' +
+            '<div class="hint">MP3 / WAV / OGG. Keep it under ~1MB — sounds are stored in your server.</div></div>' +
           '<div class="field"><label>Name</label><input id="sb-name" type="text" maxlength="32" placeholder="e.g. Airhorn" autocomplete="off"></div>' +
-          '<div class="field"><label>Emoji</label><input id="sb-emoji" type="text" maxlength="8" placeholder="ðŸ””" autocomplete="off">' +
+          '<div class="field"><label>Emoji</label><input id="sb-emoji" type="text" maxlength="8" placeholder="🔊" autocomplete="off">' +
             '<div class="swatch-row" style="margin-top:8px;">' + SB_EMOJIS.map(e => '<span class="sb-emoji-pick" data-e="' + e + '">' + e + "</span>").join("") + "</div></div>" +
         "</div>" +
         '<div class="modal-foot"><button class="btn btn-ghost" data-close>Cancel</button><button class="btn btn-primary" id="sb-save" style="width:auto;">Add sound</button></div>' +
@@ -1506,10 +1657,10 @@ const me = S.user;
     byId("sb-save").addEventListener("click", () => {
       const file = byId("sb-file").files && byId("sb-file").files[0];
       if (!file) return toast("Pick an audio file first.", "err");
-      if (file.size > 1024 * 1024) return toast("Audio is larger than 1MB â€” pick a smaller file.", "err");
+      if (file.size > 1024 * 1024) return toast("Audio is larger than 1MB — pick a smaller file.", "err");
       const name = (byId("sb-name").value || "").trim();
       if (!name) return toast("Give the sound a name.", "err");
-      const emoji = (byId("sb-emoji").value || "ðŸ””").trim() || "ðŸ””";
+      const emoji = (byId("sb-emoji").value || "🔊").trim() || "🔊";
       const r = new FileReader();
       r.onload = () => {
         supabaseClient.from("soundboard").insert({
@@ -1540,7 +1691,7 @@ const me = S.user;
     const render = () => {
       const body = tab === "create"
         ? '<div class="field"><label>Server name (optional)</label><input id="cs-name" type="text" maxlength="28" placeholder="Leave empty for a random name" autocomplete="off">' +
-          '<div class="hint">Empty â†’ assigned a random name like "' + randServerName() + '". Rename any time in Settings.</div></div>' +
+          '<div class="hint">Empty → assigned a random name like "' + randServerName() + '". Rename any time in Settings.</div></div>' +
           '<button class="btn btn-green" id="cs-go" style="width:100%;">' + ic("plus", 17) + " Create server</button>"
         : '<div class="field"><label>Invite code</label><input id="cs-code" type="text" maxlength="8" placeholder="e.g. K4LQ2P" autocomplete="off" style="text-transform:uppercase;">' +
           '<div class="hint">Server owners share a 6-character code so you can join their environment.</div></div>' +
@@ -1567,7 +1718,7 @@ const me = S.user;
           const g = createGuild(name || null);
           S.activeGuildId = g.id; S.activeChannel = "voice";
           closeModal(); goHome();
-          toast('Created "' + g.name + '" Â· invite code ' + g.invite + ".", "ok");
+          toast('Created "' + g.name + '" · invite code ' + g.invite + ".", "ok");
         } else {
           joinGuildByCode(codeIn.value);
         }
@@ -1616,7 +1767,7 @@ const me = S.user;
         html += '<div class="field"><label>Server name</label>' +
           '<div style="display:flex;gap:8px;"><input id="srv-name" type="text" maxlength="28" value="' + esc(g ? g.name : "") + '" ' + (isOwner ? "" : "disabled") + ">" +
           '<button class="btn btn-ghost btn-sm" id="srv-save" ' + (isOwner ? "" : "disabled") + ">Save</button></div>" +
-          '<div class="hint">' + (isOwner ? "You own this server â€” rename it any time." : "Only the owner of the server can rename it.") + "</div></div>";
+          '<div class="hint">' + (isOwner ? "You own this server — rename it any time." : "Only the owner of the server can rename it.") + "</div></div>";
         if (isOwner) {
           html += '<div class="setting-row"><div><div class="s-title">Danger zone</div><div class="s-desc">Deleting removes the server and its call for everyone.</div></div>' +
             '<button class="btn btn-danger-soft btn-sm" id="srv-del">' + ic("trash", 14) + " Delete server</button></div>";
@@ -1649,7 +1800,7 @@ const me = S.user;
     };
     showModal(
       '<div class="modal">' +
-        '<div class="modal-head"><div style="display:flex;align-items:center;gap:9px;">' + ic("gear", 17) + "<div><div style=\"font-weight:800;\">Settings</div><div style=\"font-size:12px;color:var(--tx-3);\">" + esc(S.user.name) + (g ? " Â· " + esc(g.name) : "") + "</div></div></div>" +
+        '<div class="modal-head"><div style="display:flex;align-items:center;gap:9px;">' + ic("gear", 17) + "<div><div style=\"font-weight:800;\">Settings</div><div style=\"font-size:12px;color:var(--tx-3);\">" + esc(S.user.name) + (g ? " · " + esc(g.name) : "") + "</div></div></div>" +
         '<button class="modal-x" data-close>' + ic("x", 18) + "</button></div>" +
         '<div class="modal-body">' +
           '<div class="tabs-inline">' +
@@ -1742,7 +1893,7 @@ const me = S.user;
         return '<div class="invite-row">' +
           '<div class="avatar" style="width:38px;height:38px;background:' + u.color + '">' + esc(initials(u.name)) + "</div>" +
           '<div class="ir-info"><div class="ir-name">' + esc(u.name) + (self ? ' <span style="color:var(--tx-3);font-weight:600;font-size:12px;">(you)</span>' : "") + "</div>" +
-          '<div class="ir-status">' + (inCall ? ic("headphone", 11) + ' <span style="color:var(--green);">In the call</span>' : "In the server Â· online") + "</div></div>" +
+          '<div class="ir-status">' + (inCall ? ic("headphone", 11) + ' <span style="color:var(--green);">In the call</span>' : "In the server · online") + "</div></div>" +
           '<div class="ir-actions">' + action + "</div></div>";
       }).join("");
       byId("iv-rows").innerHTML = rows || '<p class="ill-hint">This server has no other members.</p>';
@@ -1768,7 +1919,7 @@ const me = S.user;
     };
     showModal(
       '<div class="modal">' +
-        '<div class="modal-head"><div style="display:flex;align-items:center;gap:9px;">' + ic("userPlus", 17) + "<div><div style=\"font-weight:800;\">Add participants</div><div style=\"font-size:12px;color:var(--tx-3);\">" + esc(g.name) + " Â· " + g.call.length + " in the call</div></div></div>" +
+        '<div class="modal-head"><div style="display:flex;align-items:center;gap:9px;">' + ic("userPlus", 17) + "<div><div style=\"font-weight:800;\">Add participants</div><div style=\"font-size:12px;color:var(--tx-3);\">" + esc(g.name) + " · " + g.call.length + " in the call</div></div></div>" +
         '<button class="modal-x" data-close>' + ic("x", 18) + "</button></div>" +
         '<div class="modal-body">' +
           '<div class="code-pill" style="margin-bottom:14px;">Invite code&nbsp;<code>' + esc(g.invite) + "</code>" +
@@ -1968,7 +2119,7 @@ const me = S.user;
             },
             onError: (e) => {
               const codes = { 2: "invalid parameter", 5: "HTML5 error", 100: "video not found", 101: "embed denied", 150: "embed denied" };
-              logPlayer("error", "YouTube IFrame error " + e.data + " â€” " + (codes[e.data] || "unknown"));
+              logPlayer("error", "YouTube IFrame error " + e.data + " — " + (codes[e.data] || "unknown"));
               done(false);
             },
           },
@@ -2021,20 +2172,20 @@ const me = S.user;
       }
       const t = curTrack();
       if (t && t.ytId) {
-        logPlayer("warn", "All <audio> candidates failed for " + (t.title || t.ytId) + " â€” falling back to YouTube IFrame.");
+        logPlayer("warn", "All <audio> candidates failed for " + (t.title || t.ytId) + " — falling back to YouTube IFrame.");
         t.source = "ytiframe";
         t.url = null; t.audUrls = null;
         playViaYouTubeIframe(t.ytId, true).then(ok => {
           if (!ok) {
-            logPlayer("error", "YouTube IFrame also failed for " + t.ytId + " â€” skipping.");
-            toast("This video can't be played â€” skipping.", "err");
+            logPlayer("error", "YouTube IFrame also failed for " + t.ytId + " — skipping.");
+            toast("This video can't be played — skipping.", "err");
             nextTrack({ auto: true });
           }
         });
         return;
       }
-      logPlayer("error", "All audio candidates failed and no ytId to fall back to â€” skipping.");
-      toast("Audio stream error â€” skipping to next track.", "err");
+      logPlayer("error", "All audio candidates failed and no ytId to fall back to — skipping.");
+      toast("Audio stream error — skipping to next track.", "err");
       nextTrack({ auto: true });
     });
     audioEl.setAttribute("playsinline", "");
@@ -2202,35 +2353,35 @@ const me = S.user;
     if (autoPlay) SP.playing = true;
     const t = curTrack();
 
-    // Already playing via <audio> â€” resume immediately
+    // Already playing via <audio> — resume immediately
     if (t && t.ytId === ytId && t.source === "audio" && t.url) {
       playAudioTrack(t, autoPlay);
       return;
     }
 
-    // Already on IFrame for this track â€” just play/pause
+    // Already on IFrame for this track — just play/pause
     if (t && t.ytId === ytId && t.source === "ytiframe" && ytPlayer && ytPlayerReady) {
       if (autoPlay) { try { ytPlayer.playVideo(); } catch(e){} }
       else { try { ytPlayer.pauseVideo(); } catch(e){} }
       return;
     }
 
-    // ---- FAST PATH: resolvers were down recently â†’ go straight to IFrame ----
+    // ---- FAST PATH: resolvers were down recently → go straight to IFrame ----
     if (isResolverKnownDown()) {
-      logPlayer("info", "Resolvers marked down â€” using YouTube IFrame directly for " + ytId);
+      logPlayer("info", "Resolvers marked down — using YouTube IFrame directly for " + ytId);
       if (t && t.ytId === ytId) { t.source = "ytiframe"; t.url = null; t.audUrls = null; }
       const ok = await playViaYouTubeIframe(ytId, autoPlay);
       if (!ok) {
-        logPlayer("error", "YouTube IFrame failed for " + ytId + " â€” skipping.");
-        toast("This video can't be embedded â€” skipping.", "err");
+        logPlayer("error", "YouTube IFrame failed for " + ytId + " — skipping.");
+        toast("This video can't be embedded — skipping.", "err");
         if (SP.on && curTrack() && curTrack().ytId === ytId) nextTrack({ auto: true });
       }
       return;
     }
 
     // ---- SLOW PATH: try resolvers with a tight timeout ----
-    logPlayer("info", "Resolving audio stream for " + ytId + "â€¦");
-    toast("Resolving audio streamâ€¦", "info");
+    logPlayer("info", "Resolving audio stream for " + ytId + "…");
+    toast("Resolving audio stream…", "info");
 
     let urls = [];
     try { urls = await resolveInvidiousCandidates(ytId, 3500); } catch(e) { urls = []; }
@@ -2249,14 +2400,14 @@ const me = S.user;
 
     // ---- FAILURE: mark resolvers down for 30 min, use IFrame ----
     markResolverDown();
-    logPlayer("warn", "Resolvers unreachable â€” cached for 30 min. Using YouTube IFrame for " + ytId);
-    toast("Resolvers down â€” using YouTube player.", "info");
+    logPlayer("warn", "Resolvers unreachable — cached for 30 min. Using YouTube IFrame for " + ytId);
+    toast("Resolvers down — using YouTube player.", "info");
 
     if (t && t.ytId === ytId) { t.source = "ytiframe"; t.url = null; t.audUrls = null; }
     const ok = await playViaYouTubeIframe(ytId, autoPlay);
     if (!ok) {
       logPlayer("error", "YouTube IFrame failed for " + ytId + " (embed denied or network). Skipping.");
-      toast("This video can't be embedded â€” skipping.", "err");
+      toast("This video can't be embedded — skipping.", "err");
       if (SP.on && curTrack() && curTrack().ytId === ytId) nextTrack({ auto: true });
     } else {
       logPlayer("info", "Now playing " + ytId + " via YouTube IFrame.");
@@ -2786,9 +2937,9 @@ const me = S.user;
         '<button class="btn btn-primary btn-sm" id="sp-search-go" style="padding:0 14px;">' + ic("search", 15) + ' Search</button>' +
       '</div>';
       h += '<div class="sp-chips">' +
-        '<span class="sp-chip" data-qchip="Lofi Hip Hop Beats">â˜• Lofi Beats</span>' +
-        '<span class="sp-chip" data-qchip="Synthwave Chill">ðŸŒ† Synthwave</span>' +
-        '<span class="sp-chip" data-qchip="Pop Hits">âœ¨ Pop Hits</span>' +
+        '<span class="sp-chip" data-qchip="Lofi Hip Hop Beats">☕ Lofi Beats</span>' +
+        '<span class="sp-chip" data-qchip="Synthwave Chill">🌆 Synthwave</span>' +
+        '<span class="sp-chip" data-qchip="Pop Hits">✨ Pop Hits</span>' +
       '</div>';
       h += '<div id="sp-search-results"><div style="text-align:center;padding:24px 12px;color:var(--tx-3);font-size:12.5px;">Type a song title, choose a suggestion chip, or paste a YouTube link.</div></div>';
     } else {
@@ -2814,8 +2965,8 @@ const me = S.user;
       '<button class="btn btn-primary btn-sm" id="sp-logs-copy" style="padding:0 12px;">' + ic("copy", 14) + ' Copy all</button>' +
       '<button class="btn btn-ghost btn-sm" id="sp-logs-clear" style="padding:0 12px;">' + ic("trash", 14) + ' Clear</button>' +
       (down
-        ? '<button class="btn btn-ghost btn-sm" id="sp-logs-retry" style="padding:0 12px;color:#fbbf24;">â†» Retry resolvers now</button>'
-        : '<span style="font-size:11.5px;color:#4ade80;">âœ“ Resolvers active</span>') +
+        ? '<button class="btn btn-ghost btn-sm" id="sp-logs-retry" style="padding:0 12px;color:#fbbf24;">↻ Retry resolvers now</button>'
+        : '<span style="font-size:11.5px;color:#4ade80;">✓ Resolvers active</span>') +
       '<span style="font-size:11.5px;color:var(--tx-3);margin-left:auto;">' + playerLogs.length + ' entries</span></div>';
     if (!lines.length) {
       body += '<div style="text-align:center;padding:20px 10px;color:var(--tx-3);font-size:12px;line-height:1.6;">No playback logs yet.</div>';
@@ -2841,7 +2992,7 @@ const me = S.user;
     const rt = byId("sp-logs-retry");
     if (rt) rt.addEventListener("click", () => {
       markResolverUp();
-      logPlayer("info", "Resolver cache cleared â€” next track will re-probe Invidious/Piped.");
+      logPlayer("info", "Resolver cache cleared — next track will re-probe Invidious/Piped.");
       toast("Resolvers will be retried on the next track.", "ok");
       refreshPanels();
     });
@@ -2966,7 +3117,7 @@ const me = S.user;
     syncSpotify();
     updateStage();
     updateCtl();
-    toast(t ? "Music is active." : "Music mode on â€” search a track to start.", "ok");
+    toast(t ? "Music is active." : "Music mode on — search a track to start.", "ok");
   }
 
   function stopSpotify() {
