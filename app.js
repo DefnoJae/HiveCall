@@ -28,7 +28,7 @@
      Realtime channel "hc-<server_id>" uses broadcasts: sb_play, kick, invite.
      RLS with the anon key must allow the row ops the app performs. */
   const SUPABASE_URL = "https://xheyslqfzvidoaczlmxz.supabase.co/rest/v1/";
-  const SUPABASE_ANON_KEY = "sb_publishable_tbfjL4NUmvQ2NUQVb_jvRQ_0GblWeDL";
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhoZXlzbHFmenZpZG9hY3psbXh6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkzNTIwNTQsImV4cCI6MjEwNDkyODA1NH0.1r1B2H0_51wTDxoaj8v4XF8SYZTsSoiDj42i94hPVyg";
   const supabaseClient = (window.supabase && window.supabase.createClient)
     ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
     : null;
