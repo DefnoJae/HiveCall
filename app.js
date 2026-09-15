@@ -359,6 +359,7 @@
         toast((me ? me.name : "A server member") + " invited you to the Voice Lounge" + (gg ? " in " + gg.name : "") + "!", "info");
       }
     });
+    ch.on("broadcast", { event: "music_invite" }, p => onMusicInvite(p, gid));
     ch.subscribe();
     hcChannels = [ch];
   }
@@ -1181,6 +1182,7 @@
     startCallTimer();
     startPresenceBeat();
     playChime();
+    scheduleMusicInviteCheck();
     toast("Joined " + g.name + " · Voice Lounge", "ok");
   }
 
@@ -1539,6 +1541,17 @@
     if (sbBtn) sbBtn.classList.toggle("on-accent", !!SB.open);
   }
 
+  /* A share reference is only worth a stage while it still carries a live
+     video track — a screen stream whose track has ended (or a WebRTC feed
+     torn down without firing "close") must not park the stage on the
+     "Waiting for the presentation stream…" placeholder. */
+  function hasLiveVideoTrack(stream) {
+    if (!stream || typeof stream.getVideoTracks !== "function") return false;
+    try {
+      return (stream.getVideoTracks() || []).some(t => t && t.readyState !== "ended");
+    } catch (e) { return false; }
+  }
+
   function updateStage() {
     const c = S.call;
     if (!c) return;
@@ -1549,17 +1562,25 @@
     const main = byId("stage-main");
     const strip = byId("stage-strip");
     if (!main) return;
+    // Clear dead share references before deciding what to render.
+    if (c.display && !hasLiveVideoTrack(c.display)) c.display = null;
+    if (c.remoteShare && !hasLiveVideoTrack(c.remoteShare.stream)) c.remoteShare = null;
+    const liveShare =
+      (c.display && hasLiveVideoTrack(c.display)) ||
+      (c.remoteShare && c.remoteShare.stream && hasLiveVideoTrack(c.remoteShare.stream));
     const tiles = g.call.map(id => tileFor(id)).join("");
-    if (c.share || c.remoteShare) {
+    if (liveShare) {
       main.classList.remove("music");
       main.classList.add("share");
       main.innerHTML = shareTile();
       strip.hidden = false;
       strip.innerHTML = tiles;
     } else if (SP.on) {
-      main.classList.remove("music");
-      main.classList.add("share");
-      main.innerHTML = shareTile();
+      main.classList.remove("share");
+      main.classList.add("music");
+      if (!byId("sp-root")) renderMusic();   // build the 3D carousel + dock once
+      updateCarousel();
+      updateDock();
       strip.hidden = false;
       strip.innerHTML = tiles;
     } else {
@@ -2632,6 +2653,9 @@
   let ytPlayerReady = false;
   let ytApiPromise = null;
   let ytReadyTimer = null;
+  let ytLoadedId = null;                       // video id currently loaded in the IFrame player
+  const ytFailMemory = {};                     // ytId -> timestamp of last failed embed
+  const YT_RETRY_COOLDOWN_MS = 60 * 1000;      // don't re-attempt a failed embed for 60s
 
   function loadYouTubeIframeAPI() {
     if (window.YT && window.YT.Player) return Promise.resolve();
@@ -2653,12 +2677,28 @@
   }
 
   async function playViaYouTubeIframe(ytId, autoplay) {
+    // Same video already loaded on a ready player? Never rebuild it — just
+    // match the requested play state. Tearing down and recreating the player
+    // on every repeat call (sync/presence echo) is what made tracks restart
+    // every few seconds.
+    if (ytPlayer && ytPlayerReady && ytLoadedId === ytId) {
+      if (autoplay) { try { ytPlayer.playVideo(); } catch(e){} }
+      else { try { ytPlayer.pauseVideo(); } catch(e){} }
+      return true;
+    }
+    // This video failed to embed moments ago — don't hammer YouTube with
+    // endless rebuild/retry cycles for a track that can't play.
+    if (Date.now() - (ytFailMemory[ytId] || 0) < YT_RETRY_COOLDOWN_MS) {
+      logPlayer("warn", "YouTube IFrame for " + ytId + " failed recently — skipping reload.");
+      return false;
+    }
     try { await loadYouTubeIframeAPI(); }
     catch (e) { logPlayer("error", "Failed to load YouTube IFrame API: " + e.message); return false; }
 
     const host = document.getElementById("yt-host");
     if (!host) { logPlayer("error", "yt-host container missing"); return false; }
     if (ytPlayer && ytPlayer.destroy) { try { ytPlayer.destroy(); } catch(e){} ytPlayer = null; }
+    ytLoadedId = null;
     ytPlayerReady = false;
     if (ytReadyTimer) { clearTimeout(ytReadyTimer); ytReadyTimer = null; }
     host.innerHTML = '<div id="yt-target"></div>';
@@ -2676,6 +2716,7 @@
           events: {
             onReady: (e) => {
               ytPlayerReady = true;
+              ytLoadedId = ytId;
               if (ytReadyTimer) { clearTimeout(ytReadyTimer); ytReadyTimer = null; }
               try { e.target.setVolume(Math.round(SP.volume * 100)); } catch(err){}
               if (autoplay) { try { e.target.playVideo(); } catch(err){} }
@@ -2707,6 +2748,7 @@
     if (ytReadyTimer) { clearTimeout(ytReadyTimer); ytReadyTimer = null; }
     if (ytPlayer && ytPlayer.destroy) { try { ytPlayer.destroy(); } catch(e){} }
     ytPlayer = null;
+    ytLoadedId = null;
     ytPlayerReady = false;
     const host = document.getElementById("yt-host");
     if (host) host.innerHTML = "";
@@ -2912,7 +2954,16 @@
     if (t) {
       if (t.source === "audio" && t.url) playAudioTrack(t, SP.playing);
       else if (t.source === "sc" && t.scUrl) loadSoundCloudTrack(t, SP.playing);
-      else if (t.source === "ytiframe" && t.ytId) playViaYouTubeIframe(t.ytId, SP.playing);
+      else if (t.source === "ytiframe" && t.ytId) {
+        // Same video already live on the IFrame player? Only match play/pause —
+        // reloading here on every presence echo restarted the track in a loop.
+        if (ytPlayer && ytPlayerReady && ytLoadedId === t.ytId) {
+          if (SP.playing) { try { ytPlayer.playVideo(); } catch(e){} }
+          else { try { ytPlayer.pauseVideo(); } catch(e){} }
+        } else {
+          playViaYouTubeIframe(t.ytId, SP.playing);
+        }
+      }
       else if (t.ytId) loadYouTubeTrack(t.ytId, SP.playing);
     }
     if (S.call) { updateCarousel(); updateDynamicBackground(t); updateDock(); }
@@ -2930,10 +2981,18 @@
       return;
     }
 
-    // Already on IFrame for this track — just play/pause
-    if (t && t.ytId === ytId && t.source === "ytiframe" && ytPlayer && ytPlayerReady) {
+    // Already on IFrame for this track — just play/pause. ytLoadedId must match:
+    // a ready player holding a DIFFERENT video must not satisfy this guard.
+    if (t && t.ytId === ytId && t.source === "ytiframe" && ytPlayer && ytPlayerReady && ytLoadedId === ytId) {
       if (autoPlay) { try { ytPlayer.playVideo(); } catch(e){} }
       else { try { ytPlayer.pauseVideo(); } catch(e){} }
+      return;
+    }
+
+    // This video failed to embed very recently? Don't restart the whole
+    // resolve/rebuild cycle for it — that looped playback endlessly.
+    if (Date.now() - (ytFailMemory[ytId] || 0) < YT_RETRY_COOLDOWN_MS) {
+      logPlayer("warn", "Skipping " + ytId + " — embed failed recently (retry cooldown).");
       return;
     }
 
@@ -2943,6 +3002,7 @@
       if (t && t.ytId === ytId) { t.source = "ytiframe"; t.url = null; t.audUrls = null; }
       const ok = await playViaYouTubeIframe(ytId, autoPlay);
       if (!ok) {
+        ytFailMemory[ytId] = Date.now();
         logPlayer("error", "YouTube IFrame failed for " + ytId + " — skipping.");
         toast("This video can't be embedded — skipping.", "err");
         if (SP.on && curTrack() && curTrack().ytId === ytId) nextTrack({ auto: true });
@@ -2977,6 +3037,7 @@
     if (t && t.ytId === ytId) { t.source = "ytiframe"; t.url = null; t.audUrls = null; }
     const ok = await playViaYouTubeIframe(ytId, autoPlay);
     if (!ok) {
+      ytFailMemory[ytId] = Date.now();
       logPlayer("error", "YouTube IFrame failed for " + ytId + " (embed denied or network). Skipping.");
       toast("This video can't be embedded — skipping.", "err");
       if (SP.on && curTrack() && curTrack().ytId === ytId) nextTrack({ auto: true });
@@ -3666,6 +3727,88 @@
   }
   function togglePanel(which) { SP.openPanel = SP.openPanel === which ? null : which; refreshPanels(); updateDock(); }
 
+  /* ---------- listening-session invites ---------- */
+  function broadcastMusicInvite() {
+    const c = S.call;
+    if (!c || !supabaseClient) return;
+    const ch = getChannel(c.guildId);
+    if (!ch) return;
+    try {
+      ch.send({ type: "broadcast", event: "music_invite", payload: {
+        from: S.user.id, guildId: c.guildId,
+        music: { hostId: SP.hostId, restrict: SP.restrict, index: SP.index, queue: SP.queue, playing: SP.playing, pos: SP.pos, t0: Date.now(), volume: SP.volume }
+      } });
+    } catch (e) {}
+  }
+  function onMusicInvite(p, gid) {
+    p = broadcastPayload(p);
+    if (!p || !p.from || p.from === S.user.id) return;
+    if (!S.call || S.call.guildId !== gid) return;   // invites only count inside the call
+    if (SP.on) return;                               // already listening
+    const roster = (guilds()[gid] || {}).roster || {};
+    showMusicInviteToast(displayName(p.from, (roster[p.from] || {}).name), p.music);
+  }
+  const musicInviteState = { shownAt: 0 };
+  function showMusicInviteToast(hostName, musicState) {
+    const root = byId("toasts");
+    if (!root) return;
+    const now = Date.now();
+    if (now - musicInviteState.shownAt < 8000) return;   // one prompt at a time
+    musicInviteState.shownAt = now;
+    const el = document.createElement("div");
+    el.className = "toast invite";
+    el.innerHTML =
+      '<span class="t-icon">' + ic("info", 15) + "</span>" +
+      '<span class="t-msg"></span>' +
+      '<span class="t-actions">' +
+        '<button type="button" data-act="no">Not now</button>' +
+        '<button type="button" data-act="join" class="primary">Join</button>' +
+      "</span>";
+    el.querySelector(".t-msg").textContent = hostName + " started a listening session — Join?";
+    const close = () => { el.classList.remove("show"); setTimeout(() => el.remove(), 300); };
+    el.querySelector('[data-act="no"]').addEventListener("click", close);
+    el.querySelector('[data-act="join"]').addEventListener("click", () => { close(); joinMusicSession(musicState); });
+    root.appendChild(el);
+    requestAnimationFrame(() => el.classList.add("show"));
+    setTimeout(close, 12000);
+  }
+  /* Sync our queue, index, playback state and volume to the host's, then turn
+     music mode on (startSpotify adopts queue + index from S.callMusic). */
+  function joinMusicSession(musicState) {
+    if (!S.call || SP.on) return;
+    const m = musicState && typeof musicState === "object" && Array.isArray(musicState.queue) && musicState.queue.length
+      ? musicState
+      : (S.callMusic && Array.isArray(S.callMusic.queue) && S.callMusic.queue.length ? S.callMusic : null);
+    if (m) {
+      S.callMusic = m;
+      if (m.hostId) SP.hostId = m.hostId;   // the session host stays in charge
+      SP.restrict = !!m.restrict;
+      SP.volume = Math.max(0, Math.min(1, typeof m.volume === "number" ? m.volume : SP.volume));
+      SP.playing = !!m.playing;
+      SP.pos = m.pos || 0;
+    }
+    startSpotify();
+    // Mirror the host's volume onto already-live players (same as the volume slider).
+    if (audioEl) { try { audioEl.volume = SP.volume; } catch (e) {} }
+    if (ytPlayer && ytPlayerReady) { try { ytPlayer.setVolume(Math.round(SP.volume * 100)); } catch (e) {} }
+  }
+  /* Joined a call where a listening session is already running? Offer it ~1s
+     after landing (the music state rides in the presence snapshot "_music"). */
+  function scheduleMusicInviteCheck() {
+    musicInviteState.shownAt = 0;
+    const probe = delay => setTimeout(() => {
+      const c = S.call;
+      if (!c || SP.on) return;
+      const snap = ROSTER_MIRROR[c.guildId] || {};
+      const m = snap._music && typeof snap._music === "object" && Array.isArray(snap._music.queue) && snap._music.queue.length ? snap._music : null;
+      if (!m || !m.hostId || m.hostId === S.user.id) return;
+      const roster = (guilds()[c.guildId] || {}).roster || {};
+      showMusicInviteToast(displayName(m.hostId, (roster[m.hostId] || {}).name), m);
+    }, delay);
+    probe(1000);
+    probe(3000);   // one retry in case the presence snapshot was still loading
+  }
+
   /* ---------- session lifecycle ---------- */
   function startSpotify() {
     if (!S.call) return toast("Join a call first to start collaborative music.", "err");
@@ -3688,6 +3831,7 @@
     syncSpotify();
     updateStage();
     updateCtl();
+    broadcastMusicInvite();
     toast(t ? "Music is active." : "Music mode on — search a track to start.", "ok");
   }
 
