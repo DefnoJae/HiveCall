@@ -3177,6 +3177,9 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   let ytPlayerReady = false;
   let ytApiPromise = null;
   let ytReadyTimer = null;
+  let ytLoadedId = null;                       // video id currently loaded in the IFrame player
+  const ytFailMemory = {};                     // ytId -> timestamp of last failed embed
+  const YT_RETRY_COOLDOWN_MS = 60 * 1000;      // don't re-attempt a failed embed for 60s
 
   function loadYouTubeIframeAPI() {
     if (window.YT && window.YT.Player) return Promise.resolve();
@@ -3198,12 +3201,28 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   }
 
   async function playViaYouTubeIframe(ytId, autoplay) {
+    // Same video already loaded on a ready player? Never rebuild it — just
+    // match the requested play state. Tearing down and recreating the player
+    // on every repeat call (sync/presence echo) is what made tracks restart
+    // every few seconds.
+    if (ytPlayer && ytPlayerReady && ytLoadedId === ytId) {
+      if (autoplay) { try { ytPlayer.playVideo(); } catch(e){} }
+      else { try { ytPlayer.pauseVideo(); } catch(e){} }
+      return true;
+    }
+    // This video failed to embed moments ago — don't hammer YouTube with
+    // endless rebuild/retry cycles for a track that can't play.
+    if (Date.now() - (ytFailMemory[ytId] || 0) < YT_RETRY_COOLDOWN_MS) {
+      logPlayer("warn", "YouTube IFrame for " + ytId + " failed recently — skipping reload.");
+      return false;
+    }
     try { await loadYouTubeIframeAPI(); }
     catch (e) { logPlayer("error", "Failed to load YouTube IFrame API: " + e.message); return false; }
 
     const host = document.getElementById("yt-host");
     if (!host) { logPlayer("error", "yt-host container missing"); return false; }
     if (ytPlayer && ytPlayer.destroy) { try { ytPlayer.destroy(); } catch(e){} ytPlayer = null; }
+    ytLoadedId = null;
     ytPlayerReady = false;
     if (ytReadyTimer) { clearTimeout(ytReadyTimer); ytReadyTimer = null; }
     host.innerHTML = '<div id="yt-target"></div>';
@@ -3221,6 +3240,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
           events: {
             onReady: (e) => {
               ytPlayerReady = true;
+              ytLoadedId = ytId;
               if (ytReadyTimer) { clearTimeout(ytReadyTimer); ytReadyTimer = null; }
               try { e.target.setVolume(Math.round(SP.volume * 100)); } catch(err){}
               if (autoplay) { try { e.target.playVideo(); } catch(err){} }
@@ -3252,6 +3272,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     if (ytReadyTimer) { clearTimeout(ytReadyTimer); ytReadyTimer = null; }
     if (ytPlayer && ytPlayer.destroy) { try { ytPlayer.destroy(); } catch(e){} }
     ytPlayer = null;
+    ytLoadedId = null;
     ytPlayerReady = false;
     const host = document.getElementById("yt-host");
     if (host) host.innerHTML = "";
@@ -3457,7 +3478,16 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     if (t) {
       if (t.source === "audio" && t.url) playAudioTrack(t, SP.playing);
       else if (t.source === "sc" && t.scUrl) loadSoundCloudTrack(t, SP.playing);
-      else if (t.source === "ytiframe" && t.ytId) playViaYouTubeIframe(t.ytId, SP.playing);
+      else if (t.source === "ytiframe" && t.ytId) {
+        // Same video already live on the IFrame player? Only match play/pause —
+        // reloading here on every presence echo restarted the track in a loop.
+        if (ytPlayer && ytPlayerReady && ytLoadedId === t.ytId) {
+          if (SP.playing) { try { ytPlayer.playVideo(); } catch(e){} }
+          else { try { ytPlayer.pauseVideo(); } catch(e){} }
+        } else {
+          playViaYouTubeIframe(t.ytId, SP.playing);
+        }
+      }
       else if (t.ytId) loadYouTubeTrack(t.ytId, SP.playing);
     }
     if (S.call) { updateCarousel(); updateDynamicBackground(t); updateDock(); }
@@ -3475,10 +3505,18 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       return;
     }
 
-    // Already on IFrame for this track — just play/pause
-    if (t && t.ytId === ytId && t.source === "ytiframe" && ytPlayer && ytPlayerReady) {
+    // Already on IFrame for this track — just play/pause. ytLoadedId must match:
+    // a ready player holding a DIFFERENT video must not satisfy this guard.
+    if (t && t.ytId === ytId && t.source === "ytiframe" && ytPlayer && ytPlayerReady && ytLoadedId === ytId) {
       if (autoPlay) { try { ytPlayer.playVideo(); } catch(e){} }
       else { try { ytPlayer.pauseVideo(); } catch(e){} }
+      return;
+    }
+
+    // This video failed to embed very recently? Don't restart the whole
+    // resolve/rebuild cycle for it — that looped playback endlessly.
+    if (Date.now() - (ytFailMemory[ytId] || 0) < YT_RETRY_COOLDOWN_MS) {
+      logPlayer("warn", "Skipping " + ytId + " — embed failed recently (retry cooldown).");
       return;
     }
 
@@ -3488,6 +3526,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       if (t && t.ytId === ytId) { t.source = "ytiframe"; t.url = null; t.audUrls = null; }
       const ok = await playViaYouTubeIframe(ytId, autoPlay);
       if (!ok) {
+        ytFailMemory[ytId] = Date.now();
         logPlayer("error", "YouTube IFrame failed for " + ytId + " — skipping.");
         toast("This video can't be embedded — skipping.", "err");
         if (SP.on && curTrack() && curTrack().ytId === ytId) nextTrack({ auto: true });
@@ -3522,6 +3561,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     if (t && t.ytId === ytId) { t.source = "ytiframe"; t.url = null; t.audUrls = null; }
     const ok = await playViaYouTubeIframe(ytId, autoPlay);
     if (!ok) {
+      ytFailMemory[ytId] = Date.now();
       logPlayer("error", "YouTube IFrame failed for " + ytId + " (embed denied or network). Skipping.");
       toast("This video can't be embedded — skipping.", "err");
       if (SP.on && curTrack() && curTrack().ytId === ytId) nextTrack({ auto: true });
