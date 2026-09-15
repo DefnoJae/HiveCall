@@ -4238,3 +4238,14 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       logs: () => playerLogs.slice(),
       clearLogs: () => { playerLogs.length = 0; },
       joinCall, leaveCall, startSpotify, stopSpotify, togglePlay, nextTrack, prevTrack,
+      resolveInvidiousCandidates, loadYouTubeTrack, playViaYouTubeIframe,
+      /* voice-call internals — used by the headless smoke test */
+      openRealtime, applyActiveUsers, updateStage, tileFor, attachMedia,
+      getPeer, onIncomingCall, upsertRemote, cleanupRemote, startShareRemote, ensureShareMesh,
+      onTalkBroadcast, broadcastTalk, setTalkVisual, onSbPlay, sbBroadcast, sbPlay,
+      pushPresence, onPageResumed, kickMediaPlayback, releaseCallMedia, cleanupOnUnload,
+      toggleShare, stopShare, toggleMic
+    };
+  }
+})();
+</script>
