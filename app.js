@@ -136,8 +136,31 @@
       roster[k] = v;
       ensureProfile(k, v.name, v.color);
     });
+    // "active_users" is a read-modify-write JSON blob, so two people writing
+    // presence at the same moment can briefly clobber each other. Never drop
+    // ourselves, or a peer we hold an open WebRTC connection to, on a realtime
+    // update: that is what made people look kicked out of the call.
+    if (origin === "rt" && S.call && S.call.guildId === g.id) {
+      if (S.user && !roster[S.user.id]) {
+        const mine = users()[S.user.id] || { name: S.user.name, color: S.user.color };
+        roster[S.user.id] = {
+          name: mine.name || S.user.name, color: mine.color || S.user.color,
+          mic: !!S.call.mic, cam: !!S.call.cam, share: !!S.call.share, joinedAt: S.call.joinAt
+        };
+        ensureProfile(S.user.id, roster[S.user.id].name, roster[S.user.id].color);
+      }
+      Object.keys(S.call.peers || {}).forEach(uid => {
+        const mc = S.call.peers[uid];
+        if (roster[uid] || !mc || !mc.open || uid === S.user.id) return;
+        const p = users()[uid] || {};
+        roster[uid] = { name: p.name || "", color: p.color || "", mic: false, cam: false, share: false, joinedAt: Date.now() };
+        ensureProfile(uid, p.name, p.color);
+      });
+    }
     g.call = Object.keys(roster);
     g.roster = roster;
+    // Anyone who is no longer in the call loses their green speaking ring too.
+    Object.keys(talkState).forEach(uid => { if (!roster[uid]) clearTalkState(uid); });
     if (music && music.queue) S.callMusic = music;
     if (origin === "rt" && S.call && S.call.guildId === g.id) {
       g.call.filter(id => !prevCall.includes(id) && id !== S.user.id).forEach(id => {
@@ -149,12 +172,25 @@
       g.call.filter(id => !!((roster[id] || {}).share) && !(prevRoster[id] || {}).share).forEach(id => {
         toast(displayName(id, roster[id] && roster[id].name) + " started sharing their screen.", "info");
       });
+      prevCall.filter(id => !((roster[id] || {}).share) && !!((prevRoster[id] || {}).share)).forEach(id => {
+        toast(displayName(id, prevRoster[id] && prevRoster[id].name) + " stopped sharing their screen.", "info");
+      });
+      // Show "X is presenting" as soon as presence says so, even before the
+      // screen media connection has finished negotiating.
+      if (S.call.sharePending) {
+        Object.keys(roster).forEach(id => {
+          if (id === S.user.id) return;
+          if (roster[id].share && !(prevRoster[id] || {}).share) S.call.sharePending[id] = true;
+          if (!roster[id].share) delete S.call.sharePending[id];
+        });
+      }
     }
     if (origin !== "local" && S.call && S.call.guildId === g.id) {
       if (music && music.queue && SP.on) applySpotifySync(music);
       // Dial users we aren't connected to yet (lower-id initiates to avoid double-dials).
       if (peerOpen && S.call && S.call.guildId === g.id) {
         g.call.forEach(id => { if (id !== S.user.id && S.user.id < id) callUser(id); });
+        if (S.call.share) ensureShareMesh();     // late joiners get the screen share too
       }
       if (byId("call-view")) {
         const added = g.call.some(id => !prevCall.includes(id));
@@ -187,14 +223,21 @@
   function writePresence(gid, patch) {
     if (!supabaseClient || !gid) return;
     presenceQueue = presenceQueue.then(async () => {
-      try {
-        const { data } = await supabaseClient.from("call_presence").select("server_id,active_users").eq("server_id", gid).maybeSingle();
-        if (data && data.active_users && typeof data.active_users !== "object") return;
-        const obj = Object.assign({}, data && data.active_users || {});
-        Object.keys(patch).forEach(k => { if (patch[k] === null) delete obj[k]; else obj[k] = patch[k]; });
-        if (data) await supabaseClient.from("call_presence").update({ active_users: obj }).eq("server_id", gid);
-        else await supabaseClient.from("call_presence").insert({ server_id: gid, active_users: obj });
-      } catch (e) { console.warn("presence write failed", e); }
+      // Read-modify-write races with other clients, so retry once instead of
+      // silently losing our own roster entry.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const { data } = await supabaseClient.from("call_presence").select("server_id,active_users").eq("server_id", gid).maybeSingle();
+          if (data && data.active_users && typeof data.active_users !== "object") return;
+          const obj = Object.assign({}, data && data.active_users || {});
+          Object.keys(patch).forEach(k => { if (patch[k] === null) delete obj[k]; else obj[k] = patch[k]; });
+          if (data) await supabaseClient.from("call_presence").update({ active_users: obj }).eq("server_id", gid);
+          else await supabaseClient.from("call_presence").insert({ server_id: gid, active_users: obj });
+          return;
+        } catch (e) {
+          if (attempt === 1) console.warn("presence write failed", e);
+        }
+      }
     });
   }
 
@@ -260,6 +303,11 @@
     r.cam = !!p.cam;
     r.share = !!p.share;
     if (p.name || p.color) ensureProfile(p.from, p.name, p.color);
+    // "X is presenting" needs to appear instantly (the DB presence event lags).
+    if (S.call.sharePending) {
+      if (r.share && !prevShare) S.call.sharePending[p.from] = true;
+      if (!r.share) delete S.call.sharePending[p.from];
+    }
     if (byId("call-view")) {
       if (r.share !== prevShare) updateStage();
       else updateTileFor(p.from);
@@ -299,6 +347,7 @@
     ch.on("broadcast", { event: "sb_play" }, p => onSbPlay(p));
     ch.on("broadcast", { event: "wreg" }, p => onRenegotiation(p));
     ch.on("broadcast", { event: "state" }, p => onStateBroadcast(p));
+    ch.on("broadcast", { event: "talk" }, p => onTalkBroadcast(p));
     ch.on("broadcast", { event: "typing" }, p => onTyping(p));
     ch.on("broadcast", { event: "kick" }, message => { const p = broadcastPayload(message); if (S.call && S.call.guildId === gid && p.userId && p.userId === S.user.id) { toast("You were disconnected by a server member.", "err"); leaveCall(); } });
     ch.on("broadcast", { event: "invite" }, p => {
@@ -543,7 +592,16 @@
       const m = $(".dropdown:not(.hidden)");
       if (m && !m.contains(e.target)) m.classList.add("hidden");
     });
-    window.addEventListener("pagehide", cleanupOnUnload);
+    window.addEventListener("pagehide", e => cleanupOnUnload(e));
+    window.addEventListener("beforeunload", () => cleanupOnUnload({ persisted: false }));
+    // Backgrounding a tab/app is not leaving the call: re-assert presence and
+    // wake frozen media up again as soon as the page is visible/focused.
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) onPageResumed(); });
+    window.addEventListener("focus", () => onPageResumed());
+    // Media playback and talking-ring analysers may be blocked until the page
+    // has a user gesture — every gesture is a chance to start them.
+    ["click", "pointerdown", "keydown", "touchstart"].forEach(ev =>
+      document.addEventListener(ev, () => { resumeTalkContexts(); kickMediaPlayback(); }, true));
     supabaseClient.auth.getSession().then(({ data }) => {
       if (data.session && data.session.user) {
         SESSION_TOKEN = data.session.access_token || null;
@@ -799,6 +857,7 @@
 
   /* ======================= home ======================= */
   function renderHomeShell() {
+    setInCallFlag();
     const joined = Object.values(guilds());
     if (S.activeGuildId && !guilds()[S.activeGuildId]) S.activeGuildId = null;
     if (!S.activeGuildId && joined.length) S.activeGuildId = joined[0].id;
@@ -1108,8 +1167,8 @@
     const now = Date.now();
     S.call = {
       guildId: g.id, joinAt: now, mic: false, cam: false, share: false,
-      stream: null, display: null, hasMedia: false,
-      peers: {}, shareMc: {}, soundMc: [], soundLocal: [], soundRemote: [], remote: {}, remoteShare: null
+      stream: null, display: null, hasMedia: false, shareWaiting: false,
+      peers: {}, shareMc: {}, soundMc: [], soundLocal: [], soundRemote: [], remote: {}, remoteShare: null, sharePending: {}
     };
     // Reflect self in the roster immediately (locally + Supabase).
     g.roster = g.roster || {};
@@ -1120,6 +1179,7 @@
     renderCall();
     bootMedia();
     startCallTimer();
+    startPresenceBeat();
     playChime();
     toast("Joined " + g.name + " · Voice Lounge", "ok");
   }
@@ -1128,6 +1188,10 @@
     const c = S.call;
     if (!c) return;
     const gid = c.guildId;
+    // Stop every stream/element we own *before* the call view is discarded:
+    // detached media elements keep playing otherwise.
+    releaseCallMedia();
+    stopPresenceBeat();
     Object.keys(c.peers || {}).forEach(k => { try { c.peers[k].close(); } catch (e) {} });
     Object.keys(c.shareMc || {}).forEach(k => { try { c.shareMc[k].close(); } catch (e) {} });
     (c.soundMc || []).forEach(mc => { try { mc.close(); } catch (e) {} });
@@ -1148,6 +1212,7 @@
     if (SP.on) stopSpotify();
     if (callTimerI) { clearInterval(callTimerI); callTimerI = null; }
     goHome();
+    setInCallFlag();
     toast("You left the call.", "info");
   }
 
@@ -1169,14 +1234,87 @@
     };
     try { fetch(url + "?on_conflict=server_id", opt).catch(() => {}); } catch (e) {}
   }
-  function cleanupOnUnload() {
+  function cleanupOnUnload(e) {
+    // A bfcache/background page has not really been left — only tear the call
+    // down (and remove ourselves from presence) on a real unload.
+    if (e && e.persisted) return;
     try {
       if (peer && !peer.destroyed) peer.destroy();
-    } catch (e) {}
+    } catch (e2) {}
     const c = S.call;
-    if (c) beaconPresence(c.guildId);   // remove self from active_users
+    if (c) { releaseCallMedia(); beaconPresence(c.guildId); }   // remove self from active_users
+    stopPresenceBeat();
     SB.open = false;
   }
+
+  /* ---------------- staying connected (switching tabs ≠ leaving) ---------------- */
+  let presenceBeatI = null;
+  function startPresenceBeat() {
+    stopPresenceBeat();
+    // Re-assert our roster entry: a raced/clobbered presence write (or a
+    // backgrounded page) would otherwise leave us "kicked" until the next
+    // mic/cam/share toggle.
+    presenceBeatI = setInterval(() => {
+      if (!S.call) { stopPresenceBeat(); return; }
+      pushPresence();
+    }, 8000);
+  }
+  function stopPresenceBeat() { if (presenceBeatI) { clearInterval(presenceBeatI); presenceBeatI = null; } }
+  function onPageResumed() {
+    resumeTalkContexts();
+    if (!S.call) return;
+    pushPresence();
+    kickMediaPlayback();
+    if (peer && !peer.destroyed && peer.disconnected) { try { peer.reconnect(); } catch (e) {} }
+    tryMesh();
+    ensureShareMesh();
+  }
+  /* Browsers refuse to autoplay until the page has a gesture — retry any call
+     media that stayed frozen (silent call, black screen share). */
+  function kickMediaPlayback() {
+    const c = S.call;
+    if (!c) return;
+    let stale = false;
+    Object.keys(c.remote || {}).forEach(uid => {
+      const a = byId("va-" + uid), v = byId("vm-" + uid);
+      if (a && a.srcObject && a.paused) stale = true;
+      if (v && v.srcObject && !v.hidden && v.paused) stale = true;
+    });
+    const sv = byId("share-video");
+    if (sv && sv.srcObject && !sv.muted && sv.paused) stale = true;
+    if (stale) attachMedia();
+  }
+  /* A detached <audio>/<video> keeps playing after the call view is torn down,
+     which is why people could still hear the call after they left. Release
+     every stream explicitly. */
+  function releaseCallMedia() {
+    $$("audio, video").forEach(el => {
+      if (!el.closest || !el.closest("#call-view")) return;
+      try { el.pause(); } catch (e) {}
+      try { el.srcObject = null; } catch (e) {}
+    });
+    Object.keys(soundWait).forEach(k => { clearTimeout(soundWait[k]); delete soundWait[k]; });
+    const c = S.call;
+    if (c) {
+      Object.keys(c.remote || {}).forEach(uid => {
+        const r = c.remote[uid];
+        if (r && r.stream) { try { r.stream.getTracks().forEach(t => t.stop()); } catch (e) {} }
+        unwatchTalkLevel(uid);
+        delete c.remote[uid];
+      });
+      if (c.remoteShare && c.remoteShare.stream) { try { c.remoteShare.stream.getTracks().forEach(t => t.stop()); } catch (e) {} }
+      c.remoteShare = null;
+      c.sharePending = {};
+      (c.soundRemote || []).forEach(a => {
+        try { a.pause(); } catch (e) {}
+        try { a.srcObject = null; } catch (e) {}
+      });
+      c.soundRemote.length = 0;
+    }
+    clearTalkState();
+    talkSent.state = false; talkSent.at = 0; talkSent.level = 0;
+  }
+  function setInCallFlag() { try { document.body.classList.toggle("in-call", !!S.call); } catch (e) {} }
 
   /* ---------------- PeerJS mesh ---------------- */
   let peer = null, peerOpen = false, peerError = false;
@@ -1185,10 +1323,17 @@
       if (!peerError) { peerError = true; toast("PeerJS network is ready in the <head> tag — it seems to be missing.", "err"); }
       return null;
     }
-    if (peer && !peer.destroyed) return peer;
+    if (peer && !peer.destroyed) {
+      if (peer.disconnected) { try { peer.reconnect(); } catch (e) {} }
+      return peer;
+    }
     peerError = false;
     peer = new window.Peer(S.user.id, { debug: 1 });
-    peer.on("open", () => { peerOpen = true; tryMesh(); });
+    peer.on("open", () => { peerOpen = true; tryMesh(); ensureShareMesh(); });
+    // The signalling socket drops whenever a tab sleeps — reconnect instead of
+    // staying silently deaf for the rest of the call.
+    peer.on("disconnected", () => { if (S.call) { try { peer.reconnect(); } catch (e) {} } });
+    peer.on("close", () => { peerOpen = false; });
     peer.on("error", e => { peerError = true; if (e && e.type === "unavailable-id") console.warn("peer id conflict", e); });
     peer.on("call", onIncomingCall);
     return peer;
@@ -1215,20 +1360,15 @@
   function onIncomingCall(mc) {
     const c = S.call, uid = mc.peer;
     if (!c) { try { mc.close(); } catch (e) {} return; }
+    const kind = mc.metadata && mc.metadata.kind ? mc.metadata.kind : "";
     const roster = (guilds()[c.guildId] || {}).roster || {};
     const haveMain = !!(c.peers[uid] && c.peers[uid].open);
-    const isShare = (mc.metadata && mc.metadata.kind === "share") ||
-      (!!(roster[uid] && roster[uid].share) && haveMain);
-    if (isShare) {
+    // Sound-board clips arrive on their own media connection and must be routed
+    // before the screen-share heuristic, otherwise a clip played by someone who
+    // is sharing their screen would be mistaken for the share stream.
+    if (kind === "sound") {
       try { mc.answer(); } catch (e) {}
-      c.shareMc[uid] = mc;
-      mc.on("stream", s => { c.remoteShare = { id: uid, stream: s }; updateStage(); });
-      mc.on("close", () => { if (c && c.remoteShare && c.remoteShare.id === uid) { c.remoteShare = null; updateStage(); } });
-      mc.on("error", () => { if (c && c.remoteShare && c.remoteShare.id === uid) { c.remoteShare = null; updateStage(); } });
-      return;
-    }
-    if (mc.metadata && mc.metadata.kind === "sound") {
-      try { mc.answer(); } catch (e) {}
+      if (soundWait[uid]) { clearTimeout(soundWait[uid]); delete soundWait[uid]; }
       const audio = document.createElement("audio");
       audio.autoplay = true;
       audio.playsInline = true;
@@ -1238,6 +1378,21 @@
       const remove = () => { const i = c.soundRemote.indexOf(audio); if (i !== -1) c.soundRemote.splice(i, 1); try { audio.pause(); audio.srcObject = null; } catch (e) {} };
       mc.on("close", remove);
       mc.on("error", remove);
+      return;
+    }
+    const isShare = kind === "share" || (!kind && !!(roster[uid] && roster[uid].share) && haveMain);
+    if (isShare) {
+      try { mc.answer(); } catch (e) {}
+      c.shareMc[uid] = mc;
+      const drop = () => {
+        if (!c || !c.remoteShare || c.remoteShare.id !== uid) return;
+        c.remoteShare = null;
+        if (c.sharePending && roster[uid] && roster[uid].share) c.sharePending[uid] = true;
+        updateStage();
+      };
+      mc.on("stream", s => { c.remoteShare = { id: uid, stream: s }; if (c.sharePending) delete c.sharePending[uid]; updateStage(); });
+      mc.on("close", drop);
+      mc.on("error", drop);
       return;
     }
     try { mc.answer(c.stream || undefined); } catch (e) {}
@@ -1267,20 +1422,50 @@
     if (!c) return;
     const still = Object.keys(c.peers).some(k => c.peers[k] && c.peers[k].open && !(c.peers[k] === c.shareMc[uid]));
     if (c.shareMc[uid]) { delete c.shareMc[uid]; }
-    if (!still) { unwatchTalkLevel(uid); delete c.remote[uid]; }
+    if (!still) { unwatchTalkLevel(uid); delete c.remote[uid]; clearTalkState(uid); }
+    pruneIfGone(uid);
     updateStage();
   }
+  /* Presence can lag behind the media connection: once a peer's connection has
+     closed and the shared roster no longer lists them, drop them locally too. */
+  function pruneIfGone(uid) {
+    const c = S.call;
+    if (!c || !uid || uid === S.user.id) return;
+    const open = Object.keys(c.peers || {}).some(k => k === uid && c.peers[k] && c.peers[k].open);
+    if (open) return;
+    const mirror = ROSTER_MIRROR[c.guildId];
+    if (mirror && mirror[uid]) return;
+    const g = guilds()[c.guildId];
+    if (!g || !g.roster[uid]) return;
+    delete g.roster[uid];
+    g.call = (g.call || []).filter(id => id !== uid);
+    clearTalkState(uid);
+  }
   function startShareRemote(s) {
-    const c = S.call; if (!peerOpen) return;
+    const c = S.call;
+    if (!c || !s || !peerOpen || !peer) return 0;
+    let dialed = 0;
     const roster = (guilds()[c.guildId] || {}).call || [];
     roster.forEach(uid => {
       if (uid === S.user.id) return;
+      const existing = c.shareMc[uid];
+      if (existing && existing.open) return;
       try {
         const mc = peer.call(uid, s, { metadata: { kind: "share" } });
         c.shareMc[uid] = mc;
-        mc.on("error", () => { try { mc.close(); } catch (e) {} });
+        dialed++;
+        mc.on("close", () => { if (c.shareMc[uid] === mc) delete c.shareMc[uid]; });
+        mc.on("error", () => { try { mc.close(); } catch (e) {} if (c.shareMc[uid] === mc) delete c.shareMc[uid]; });
       } catch (e) {}
     });
+    return dialed;
+  }
+  /* Screen share rides one media connection per viewer, so re-dial whenever a
+     viewer connects or joins the call later. */
+  function ensureShareMesh() {
+    const c = S.call;
+    if (!c || !c.share || !c.display || !peerOpen || !peer) return;
+    startShareRemote(c.display);
   }
 
   function renderCall() {
@@ -1318,6 +1503,7 @@
       "</div>";
     updateCtl();
     updateStage();
+    setInCallFlag();
     byId("btn-back").addEventListener("click", leaveCall);
     byId("ctl-mic").addEventListener("click", toggleMic);
     byId("ctl-cam").addEventListener("click", toggleCam);
@@ -1387,6 +1573,7 @@
       const cols = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(g.call.length))));
       t.style.gridTemplateColumns = "repeat(" + cols + ", minmax(0, 1fr))";
     }
+    refreshTalkVisuals();
     attachMedia();
   }
 
@@ -1402,7 +1589,7 @@
     const micOn = self ? c.mic : !!r.mic;
     const hasVideo = self ? (camOn && c.stream && c.stream.getVideoTracks().length) : (camOn && !!(remoteSt && remoteSt.video));
     const fill =
-      '<div class="tile-fill" style="background:linear-gradient(140deg,' + u.color + ", #050506);\">" +
+      '<div class="tile-fill" style="background:linear-gradient(140deg,' + u.color + ', #050506);">' +
         '<div class="tile-avatar" style="background:' + u.color + '">' + esc(initials(u.name)) + "</div></div>";
     let body;
     if (self) {
@@ -1413,7 +1600,8 @@
         '<audio id="va-' + id + '" autoplay playsinline hidden></audio>' +
         '<video id="vm-' + id + '" autoplay playsinline hidden></video>';
     }
-    return '<div class="tile' + (self ? '' : '') + '" data-user-id="' + id + '"' + (self ? ' id="tile-self"' : ' id="tile-' + id + '"') + '">' +
+    const talking = !!(talkState[id] && talkState[id].talking);
+    return '<div class="tile' + (talking ? " talking speaking" : "") + '" data-user-id="' + id + '"' + (self ? ' id="tile-self"' : ' id="tile-' + id + '"') + '>' +
       body +
       (!self && !camOn ? '<div class="tile-camoff">' + ic("camOff", 15) + "</div>" : "") +
       '<div class="tile-tag"><span class="mic-badge ' + (micOn ? "on" : "off") + '">' + ic(micOn ? "mic" : "micOff", 13) + '</span><span class="tile-name">' + esc(u.name) + (self ? "  (you)" : "") + "</span></div>" +
@@ -1427,12 +1615,16 @@
     const remotePart = c.remoteShare;
     let label = "Screen";
     let stream = null;
+    const pendingId = Object.keys(c.sharePending || {}).find(id => !remotePart || remotePart.id !== id);
     if (c.share) {
       stream = c.display;
       label = (me ? me.name : "You") + " is presenting";
     } else if (remotePart && users()[remotePart.id]) {
       stream = remotePart.stream;
       label = users()[remotePart.id].name + " is presenting";
+    } else if (pendingId) {
+      const pu = users()[pendingId];
+      label = (pu ? pu.name : "Someone") + " is presenting";
     }
     const art =
       '<div class="tile-fill"><div style="text-align:center;color:#c9cdd3;">' +
@@ -1499,6 +1691,7 @@
       c.hasMedia = false; c.cam = false; c.mic = false;
       updateCtl(); updateStage();
       toast("Camera/microphone are not available here. You joined with your avatar.", "info");
+      getPeer();     // still reachable: peers can send us their audio / screen share
       return;
     }
     navigator.mediaDevices.getUserMedia({ audio: true, video: false })
@@ -1519,6 +1712,9 @@
         c.hasMedia = false; c.cam = false; c.mic = false;
         updateCtl(); updateStage();
         toast("Could not access camera/microphone (" + (err && err.name ? err.name : "blocked") + "). Joining with your avatar.", "err");
+        // Without a PeerJS id nobody can call us — register anyway so we still
+        // receive the others' audio, camera and screen share.
+        getPeer();
       });
   }
 
@@ -1687,10 +1883,11 @@
       if (vt) vt.addEventListener("ended", () => stopShare(true));
       const at = s.getAudioTracks()[0];
       if (at) at.addEventListener("ended", () => stopShare(true));
-      startShareRemote(s);
+      const dialed = startShareRemote(s);
       pushPresence();
       updateStage(); updateCtl();
-      toast("You are sharing your screen.", "ok");
+      c.shareWaiting = dialed === 0;
+      toast(dialed ? "You are sharing your screen." : "Screen share is live for you — waiting for the other participants to connect.", dialed ? "ok" : "info");
     } catch (err) {
       /* user cancelled the picker */
     }
@@ -1701,6 +1898,7 @@
     if (!c || !c.share) return;
     if (c.display) c.display.getTracks().forEach(t => t.stop());
     c.display = null; c.share = false;
+    c.shareWaiting = false;
     Object.keys(c.shareMc || {}).forEach(k => { try { c.shareMc[k].close(); } catch (e) {} });
     c.shareMc = {};
     updateStage(); updateCtl();
@@ -1708,9 +1906,63 @@
     toast(auto ? "Screen share ended." : "You stopped sharing.", "info");
   }
 
-  /* ---------- talking activity rings (local analysis, per user) ---------- */
+  /* ---------- talking activity rings (analysed locally, synced to peers) ----------
+     An analyser can only ever hear the local microphone, so whoever is talking
+     publishes that fact on the server channel ("talk") and every client draws
+     the same green ring around the same speaker. */
   const _watch = {};
+  const talkCtxs = new Set();
+  const talkState = {};                                  // uid -> { talking, int, at }
+  const talkSent = { state: false, at: 0, level: 0 };
   const tileEl = uid => document.querySelector('.tile[data-user-id="' + uid + '"]') || byId(uid === S.user.id ? "tile-self" : "tile-" + uid);
+  function resumeTalkContexts() {
+    talkCtxs.forEach(ctx => { try { if (ctx.state === "suspended") ctx.resume(); } catch (e) {} });
+  }
+  function setTalkVisual(uid, talking, int) {
+    const el = tileEl(uid);
+    if (!el) return;
+    el.classList.toggle("talking", !!talking);    // green glowing ring on the avatar
+    el.classList.toggle("speaking", !!talking);   // tile border glow (camera-on tiles have no avatar)
+    const av = $(".tile-avatar", el);
+    if (av) av.style.setProperty("--talk-int", String(Math.max(0, Math.min(1, int || 0))));
+  }
+  function refreshTalkVisuals() {
+    Object.keys(talkState).forEach(uid => {
+      const t = talkState[uid];
+      if (t) setTalkVisual(uid, t.talking, t.int);
+    });
+  }
+  function clearTalkState(uid) {
+    if (uid) { delete talkState[uid]; setTalkVisual(uid, false, 0); return; }
+    Object.keys(talkState).forEach(k => { delete talkState[k]; setTalkVisual(k, false, 0); });
+  }
+  /* Publish our own speaking state (throttled: ~8 updates/second while talking,
+     one final update when we stop). */
+  function broadcastTalk(level) {
+    const c = S.call;
+    if (!c || !S.user || !supabaseClient) return;
+    const talking = level > 0.3;
+    const now = Date.now();
+    if (talking === talkSent.state) {
+      if (!talking) return;                                  // already reported "stopped"
+      if (now - talkSent.at < 120) return;
+      if (Math.abs(level - talkSent.level) < 0.04 && now - talkSent.at < 500) return;
+    }
+    talkSent.state = talking; talkSent.at = now; talkSent.level = level;
+    const ch = getChannel(c.guildId);
+    if (!ch) return;
+    try {
+      ch.send({ type: "broadcast", event: "talk", payload: { from: S.user.id, talking: talking, level: Math.max(0, Math.min(1, level)) } });
+    } catch (e) {}
+  }
+  function onTalkBroadcast(p) {
+    p = broadcastPayload(p);
+    if (!S.call || !p || !p.from || p.from === S.user.id) return;
+    const talking = !!p.talking;
+    const lvl = typeof p.level === "number" ? Math.max(0, Math.min(1, p.level)) : (talking ? 1 : 0);
+    talkState[p.from] = { talking: talking, int: lvl, at: Date.now() };
+    setTalkVisual(p.from, talking, lvl);
+  }
   function playMedia(el) {
     if (!el || !el.play) return;
     el.play().catch(() => {});
@@ -1728,14 +1980,12 @@
       ctx.createMediaStreamSource(src).connect(analyser);
     } catch (e) { return; }
     const resume = () => { if (ctx && ctx.state === "suspended") { try { ctx.resume(); } catch (e) {} } };
-    if (typeof onLevel === "function") {
-      resume();
-    } else {
-      // Remote watcher: suspend stays until a user gesture on page; attach
-      // a one-time pointerdown resume AND a click resume to be safe.
-      document.addEventListener("click", resume);
-      document.addEventListener("pointerdown", resume, { once: true });
-    }
+    talkCtxs.add(ctx);
+    // A fresh AudioContext starts suspended until the page has user activation,
+    // which would leave the analyser reading silence — resume it eagerly and on
+    // every later gesture (see the boot-time listeners).
+    resume();
+    resumeTalkContexts();
     const buf = new Float32Array(analyser.fftSize);
     let smooth = 0;
     const watcher = { ctx, analyser, talking: false, int: 0, resume };
@@ -1752,12 +2002,10 @@
       if (typeof onLevel === "function") {
         onLevel(watcher.int);
       } else {
-        const el = tileEl(uid);
-        if (el) {
-          el.classList.toggle("talking", watcher.talking);
-          const av = $(".tile-avatar", el);
-          if (av) av.style.setProperty("--talk-int", String(Math.max(0, Math.min(1, watcher.int))));
-        }
+        // The speaker's own "talk" broadcast is authoritative; this local
+        // analyser is only a fallback for peers that stopped reporting.
+        const t = talkState[uid];
+        if (!t || Date.now() - t.at > 1500) setTalkVisual(uid, watcher.talking, watcher.int);
       }
       watcher.raf = requestAnimationFrame(tick);
     };
@@ -1767,18 +2015,15 @@
     const w = _watch[uid];
     if (!w) return;
     if (w.raf) cancelAnimationFrame(w.raf);
-    if (w.resume) { document.removeEventListener("click", w.resume); document.removeEventListener("pointerdown", w.resume); }
-    if (w.ctx) { try { w.ctx.close(); } catch (e) {} }
+    if (w.ctx) { talkCtxs.delete(w.ctx); try { w.ctx.close(); } catch (e) {} }
     delete _watch[uid];
-    const el = tileEl(uid);
-    if (el) { el.classList.remove("talking"); const av = $(".tile-avatar", el); if (av) av.style.removeProperty("--talk-int"); }
+    setTalkVisual(uid, false, 0);
   }
   function applySelfTalk(int) {
-    const el = tileEl(S.user.id);
-    if (!el) return;
-    el.classList.toggle("talking", int > 0.3);
-    const av = $(".tile-avatar", el);
-    if (av) av.style.setProperty("--talk-int", String(Math.max(0, Math.min(1, int))));
+    const talking = int > 0.3;
+    talkState[S.user.id] = { talking: talking, int: int, at: Date.now() };
+    setTalkVisual(S.user.id, talking, int);
+    broadcastTalk(int);
   }
 
   /* ======================= SOUND BOARD ======================= */
@@ -1798,12 +2043,16 @@
     } catch (e) { return null; }
   }
   function sbStopAllLocal() { _sbAudio.forEach(a => { try { a.pause(); a.src = ""; } catch (e) {} }); _sbAudio.length = 0; }
+  const soundWait = {};          // player id -> timer waiting for their WebRTC clip
   function sbBroadcast(s) {
     if (!S.call || !s || !supabaseClient) return;
-    playSoundboardToCall(s.dataUrl);
+    // Stream the clip into the WebRTC audio graph for everyone in the call and
+    // announce it on the channel; listeners only fall back to playing the data
+    // URL themselves when that media connection never shows up.
+    const rtc = playSoundboardToCall(s.dataUrl);
     const ch = getChannel(S.call.guildId);
     if (ch) {
-      try { ch.send({ type: "broadcast", event: "sb_play", payload: { id: s.id, name: s.name, emoji: s.emoji, dataUrl: s.dataUrl, player: S.user.id } }); } catch (e) {}
+      try { ch.send({ type: "broadcast", event: "sb_play", payload: { id: s.id, name: s.name, emoji: s.emoji, dataUrl: s.dataUrl, player: S.user.id, rtc: !!rtc } }); } catch (e) {}
     }
     const me = users()[S.user.id];
     toast((s.emoji || "🔊") + " " + s.name + " — played by " + (me ? me.name : "someone"), "info");
@@ -1812,14 +2061,24 @@
     p = broadcastPayload(p);
     if (!S.call || !p) return;
     if (p.player && p.player === S.user.id) return;
-    sbPlay(p.dataUrl);
+    if (p.rtc && p.dataUrl) {
+      // The player is pushing the clip over WebRTC — wait for that stream so the
+      // clip is not heard twice, and fall back to the data URL if it never lands.
+      if (soundWait[p.player]) clearTimeout(soundWait[p.player]);
+      soundWait[p.player] = setTimeout(() => {
+        delete soundWait[p.player];
+        sbPlay(p.dataUrl);
+      }, 900);
+    } else {
+      sbPlay(p.dataUrl);
+    }
     const nm = displayName(p.player, null);
     toast((p.emoji || "🔊") + " " + (p.name || "sound") + " — played by " + (nm || "someone"), "info");
   }
 
   function playSoundboardToCall(audioUrl) {
     const c = S.call;
-    if (!c || !audioUrl || !peerOpen || !peer) return sbPlay(audioUrl);
+    if (!c || !audioUrl || !peerOpen || !peer) { sbPlay(audioUrl); return false; }
     try {
       const audio = new Audio(audioUrl);
       audio.crossOrigin = "anonymous";
@@ -1838,6 +2097,10 @@
         if (i !== -1) c.soundLocal.splice(i, 1);
         try { audio.pause(); audio.src = ""; } catch (e) {}
         try { ctx.close(); } catch (e) {}
+        // The clip is over: close the per-peer connections instead of leaking
+        // one media connection per sound until we leave the call.
+        c.soundMc = (c.soundMc || []).filter(mc => calls.indexOf(mc) === -1);
+        calls.splice(0).forEach(mc => { try { mc.close(); } catch (e) {} });
       };
       audio.addEventListener("ended", finish, { once: true });
       const calls = [];
@@ -1852,9 +2115,14 @@
         } catch (e) {}
       });
       c.soundMc.push(...calls);
+      // A suspended context is silent for us *and* for the peers (they receive
+      // this context's output stream), so nudge it awake.
+      if (ctx.state === "suspended") { try { const pr = ctx.resume(); if (pr && pr.catch) pr.catch(() => {}); } catch (e) {} }
       audio.play().catch(() => {});
+      return calls.length > 0;
     } catch (e) {
       sbPlay(audioUrl);
+      return false;
     }
   }
   function onSoundboardRealtime(payload) {
@@ -3188,271 +3456,3 @@
   }
   function parseSoundCloudUrl(input) {
     const raw = (input || "").trim();
-    if (!raw) return null;
-    let m = raw.match(/^https?:\/\/(?:www\.|app\.|m\.|api\.)?soundcloud\.com\/([^\/?#]+)\/(?:sets\/)?([^\/?#]+)/i);
-    if (m) {
-      const artist = decodeURIComponent(m[1].trim());
-      if (/^(search|people|you|popular|charts|stream|upload|settings|discover|creators|signin|forgot-password|notifications|messages)$/i.test(artist)) return null;
-      let slug = m[2].trim();
-      if (/^https?:\/\//i.test(slug)) return null;
-      return { artist, slug: decodeURIComponent(slug.replace(/\/+$/, "")), url: raw.replace(/[?#].*$/, "").replace(/\/$/, ""), type: /\/sets\//i.test(raw) ? "set" : "track" };
-    }
-    return null;
-  }
-  const humanizeSlug = s => (s || "").replace(/[-_+]+/g, " ").replace(/\b\w/g, c => c.toUpperCase()).trim();
-  async function resolveSoundCloudUrl(inputUrl) {
-    const m = parseSoundCloudUrl(inputUrl);
-    if (!m) return null;
-    const track = {
-      id: "sc_" + m.artist + "_" + m.slug, source: "sc", scUrl: m.url, scType: m.type || "track",
-      title: humanizeSlug(m.slug), artist: humanizeSlug(m.artist), album: "SoundCloud",
-      dur: 210000, artUrl: "", thumbUrl: "", embeddable: true, oembedOk: false
-    };
-    try {
-      const ctrl = new AbortController();
-      const tid = setTimeout(() => ctrl.abort(), 5000);
-      const res = await fetch("https://soundcloud.com/oembed?url=" + encodeURIComponent(m.url) + "&format=json", { signal: ctrl.signal });
-      clearTimeout(tid);
-      if (res.ok) {
-        const o = await res.json();
-        if (o.title) track.title = o.title;
-        if (o.author_name) track.artist = o.author_name;
-        if (o.thumbnail_url) {
-          track.thumbUrl = o.thumbnail_url;
-          const hi = o.thumbnail_url.replace(/-(?:t\d+x\d+|large|small|crop)\.jpg$/i, "-t500x500.jpg");
-          track.artUrl = /\.jpg$/i.test(hi) ? hi : o.thumbnail_url;
-        }
-        track.oembedOk = true;
-      }
-    } catch (e) {}
-    return track;
-  }
-
-  function queuePanelHTML() {
-    const tab = SP.panelTab || "search";
-    let h = '<div class="tabs-inline" style="margin-bottom:12px;">' +
-      '<button class="tab-inline ' + (tab === "search" ? "active" : "") + '" data-qtab="search">Search</button>' +
-      '<button class="tab-inline ' + (tab === "queue" ? "active" : "") + '" data-qtab="queue">Up Next (' + SP.queue.length + ')</button>' +
-      '</div>';
-    if (tab === "search") {
-      h += '<div style="display:flex;gap:8px;margin-bottom:10px;">' +
-        '<input id="sp-search-in" type="text" placeholder="Search songs, artists, or paste a YouTube / SoundCloud link..." style="flex:1;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.18);border-radius:10px;padding:8px 12px;color:#fff;font-size:13px;outline:none;" />' +
-        '<button class="btn btn-primary btn-sm" id="sp-search-go" style="padding:0 14px;">' + ic("search", 15) + ' Search</button>' +
-      '</div>';
-      h += '<div class="sp-chips">' +
-        '<span class="sp-chip" data-qchip="Lofi Hip Hop Beats">☕ Lofi Beats</span>' +
-        '<span class="sp-chip" data-qchip="Synthwave Chill">🌆 Synthwave</span>' +
-        '<span class="sp-chip" data-qchip="Pop Hits">✨ Pop Hits</span>' +
-      '</div>';
-      h += '<div id="sp-search-results"><div style="text-align:center;padding:24px 12px;color:var(--tx-3);font-size:12.5px;">Type a song title, choose a suggestion chip, or paste a YouTube link.</div></div>';
-    } else {
-      h += '<div class="sp-ph"><span>Up Next Queue</span><span class="sp-ph-sub">' + SP.queue.length + ' tracks</span></div>';
-      h += '<div style="display:flex;flex-direction:column;gap:5px;margin-top:8px;">';
-      SP.queue.forEach((t, i) => {
-        const art = t.thumbUrl || t.artUrl;
-        h += '<div class="sp-qrow ' + (i === SP.index ? 'now' : '') + '">' +
-          '<div class="sp-qart" style="background-image:' + (art ? 'url(\'' + art + '\')' : artCSS(t)) + '"></div>' +
-          '<div class="sp-qti"><div class="sp-qtt">' + esc(t.title) + '</div><div class="sp-qta">' + esc(t.artist) + '</div></div>' +
-          (i === SP.index ? '<span class="sp-qnow" title="Playing now">' + ic("volume", 15) + '</span>' : (canControl() ? '<button class="sp-qx" data-rm="' + i + '" title="Remove from queue">' + ic("x", 13) + '</button>' : '<span class="sp-qlock">' + ic("lock", 12) + '</span>')) +
-        '</div>';
-      });
-      h += '</div>';
-    }
-    return h;
-  }
-
-  function logsPanelHTML() {
-    const lines = playerLogs.slice().reverse();
-    const down = isResolverKnownDown();
-    let body = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">' +
-      '<button class="btn btn-primary btn-sm" id="sp-logs-copy" style="padding:0 12px;">' + ic("copy", 14) + ' Copy all</button>' +
-      '<button class="btn btn-ghost btn-sm" id="sp-logs-clear" style="padding:0 12px;">' + ic("trash", 14) + ' Clear</button>' +
-      (down
-        ? '<button class="btn btn-ghost btn-sm" id="sp-logs-retry" style="padding:0 12px;color:#fbbf24;">↻ Retry resolvers now</button>'
-        : '<span style="font-size:11.5px;color:#4ade80;">✓ Resolvers active</span>') +
-      '<span style="font-size:11.5px;color:var(--tx-3);margin-left:auto;">' + playerLogs.length + ' entries</span></div>';
-    if (!lines.length) {
-      body += '<div style="text-align:center;padding:20px 10px;color:var(--tx-3);font-size:12px;line-height:1.6;">No playback logs yet.</div>';
-    } else {
-      body += '<div class="sp-loglist">' + lines.map(l =>
-        '<div class="sp-logline ' + (l.level === "error" ? "err" : l.level === "warn" ? "warn" : "info") + '">' +
-          '<span class="sp-log-t">' + fmtTime(l.t) + '</span>' +
-          '<span class="sp-log-l">' + l.level + '</span>' +
-          '<span class="sp-log-m">' + esc(l.msg) + '</span>' +
-        '</div>').join("") + '</div>';
-    }
-    return '<div class="sp-ph"><span>Playback Logs</span><span class="sp-ph-sub">errors &amp; diagnostics</span></div>' + body;
-  }
-
-  function wireLogsPanel() {
-    const cp = byId("sp-logs-copy");
-    if (cp) cp.addEventListener("click", () => {
-      const text = playerLogs.map(l => "[" + fmtTime(l.t) + "] " + l.level.toUpperCase() + " " + l.msg).join("\n");
-      copyText(text).then(ok => toast(ok ? "Copied " + playerLogs.length + " log lines." : "Copy failed.", ok ? "ok" : "err"));
-    });
-    const cl = byId("sp-logs-clear");
-    if (cl) cl.addEventListener("click", () => { playerLogs.length = 0; refreshPanels(); toast("Logs cleared.", "ok"); });
-    const rt = byId("sp-logs-retry");
-    if (rt) rt.addEventListener("click", () => {
-      markResolverUp();
-      logPlayer("info", "Resolver cache cleared — next track will re-probe Invidious/Piped.");
-      toast("Resolvers will be retried on the next track.", "ok");
-      refreshPanels();
-    });
-  }
-
-  let lastSearchResults = [];
-  function wireQueuePanel() {
-    $$("#sp-panel-queue [data-qtab]").forEach(b => b.addEventListener("click", () => { SP.panelTab = b.dataset.qtab; refreshPanels(); }));
-    $$("#sp-panel-queue [data-rm]").forEach(b => b.addEventListener("click", () => { dequeueAt(parseInt(b.dataset.rm, 10)); }));
-    $$("#sp-panel-queue [data-qchip]").forEach(chip => chip.addEventListener("click", () => {
-      const searchIn = byId("sp-search-in");
-      if (searchIn) { searchIn.value = chip.dataset.qchip; doSearch(chip.dataset.qchip); }
-    }));
-
-    const searchIn = byId("sp-search-in");
-    const searchGo = byId("sp-search-go");
-    const doSearch = async (forcedQuery) => {
-      const rawQ = (typeof forcedQuery === "string" ? forcedQuery : (searchIn ? searchIn.value : "")).trim();
-      if (!rawQ) return;
-      if (searchGo) searchGo.disabled = true;
-      const box = byId("sp-search-results");
-      if (box) box.innerHTML = '<div style="text-align:center;padding:24px;color:var(--tx-3);font-size:13px;"><div class="sp-spinner" style="margin:0 auto 10px;"></div>Searching for "<b>' + esc(rawQ) + '</b>"...</div>';
-      try {
-        const results = await searchYouTube(rawQ);
-        lastSearchResults = results;
-        renderSearchResults(results);
-      } catch (err) {
-        if (box) box.innerHTML = '<div style="text-align:center;padding:20px;color:var(--red);font-size:12.5px;">Search error: ' + esc(err.message) + '</div>';
-      } finally {
-        if (searchGo) searchGo.disabled = false;
-      }
-    };
-
-    if (searchGo) searchGo.addEventListener("click", () => doSearch());
-    if (searchIn) {
-      searchIn.addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
-      if (lastSearchResults.length && !searchIn.value) renderSearchResults(lastSearchResults);
-    }
-  }
-
-  function renderSearchResults(tracks) {
-    const box = byId("sp-search-results");
-    if (!box) return;
-    if (!tracks.length) {
-      box.innerHTML = '<div style="padding:20px;text-align:center;color:var(--tx-3);font-size:12.5px;">No tracks found. Try a direct YouTube link.</div>';
-      return;
-    }
-    let h = '<div style="display:flex;flex-direction:column;gap:6px;max-height:280px;overflow-y:auto;margin-top:6px;padding-right:2px;">';
-    tracks.forEach((t, i) => {
-      const art = t.thumbUrl || t.artUrl || (t.ytId ? ("https://img.youtube.com/vi/" + t.ytId + "/hqdefault.jpg") : "");
-      h += '<div class="sp-res-row">' +
-        '<div class="sp-res-art" style="background-image:url(\'' + art + '\')"></div>' +
-        '<div class="sp-res-info">' +
-          '<div class="sp-res-title" title="' + esc(t.title) + '">' + esc(t.title) + '</div>' +
-          '<div class="sp-res-artist" title="' + esc(t.artist) + '">' + esc(t.artist) + '</div>' +
-        '</div>' +
-        '<div class="sp-res-acts">' +
-          '<button class="sp-btn-sm sp-btn-queue" data-add-res="' + i + '" title="Append to queue">' + ic("plus", 12) + ' Queue</button>' +
-          '<button class="sp-btn-sm sp-btn-playnow" data-play-res="' + i + '" title="Play immediately">' + ic("spPlay", 12) + ' Play</button>' +
-        '</div>' +
-      '</div>';
-    });
-    h += '</div>';
-    box.innerHTML = h;
-
-    $$("[data-add-res]", box).forEach(b => b.addEventListener("click", async () => {
-      const idx = parseInt(b.dataset.addRes, 10);
-      const item = tracks[idx];
-      if (!item) return;
-      const added = await enqueue({ ...item });
-      if (!added) return;
-      b.innerHTML = ic("check", 12) + ' Added';
-      b.disabled = true;
-      setTimeout(() => { b.disabled = false; b.innerHTML = ic("plus", 12) + ' Queue'; }, 1500);
-    }));
-
-    $$("[data-play-res]", box).forEach(b => b.addEventListener("click", () => {
-      const idx = parseInt(b.dataset.playRes, 10);
-      const item = tracks[idx];
-      if (!item) return;
-      enqueue({ ...item }, { playNow: true });
-    }));
-  }
-
-  function refreshPanels() {
-    const pq = byId("sp-panel-queue"), pl = byId("sp-panel-lyrics"), lg = byId("sp-panel-logs");
-    if (pq) {
-      pq.classList.toggle("open", SP.openPanel === "queue");
-      if (SP.openPanel === "queue") { pq.innerHTML = queuePanelHTML(); wireQueuePanel(); }
-    }
-    if (pl) {
-      pl.classList.toggle("open", SP.openPanel === "lyrics");
-      if (SP.openPanel === "lyrics") pl.innerHTML = '<div class="sp-ph"><span>Lyrics</span></div><div class="sp-lyrics" style="text-align:center;padding:20px;color:var(--tx-3);">Lyrics not available.</div>';
-    }
-    if (lg) {
-      lg.classList.toggle("open", SP.openPanel === "logs");
-      if (SP.openPanel === "logs") { lg.innerHTML = logsPanelHTML(); wireLogsPanel(); }
-    }
-    refreshProgress();
-  }
-  function togglePanel(which) { SP.openPanel = SP.openPanel === which ? null : which; refreshPanels(); updateDock(); }
-
-  /* ---------- session lifecycle ---------- */
-  function startSpotify() {
-    if (!S.call) return toast("Join a call first to start collaborative music.", "err");
-    if (SP.on) return;
-    // If we have a fresh music snapshot from call presence, adopt its queue.
-    if (S.callMusic && Array.isArray(S.callMusic.queue) && S.callMusic.queue.length) {
-      SP.queue = S.callMusic.queue;
-      SP.index = Math.max(0, Math.min(S.callMusic.index || 0, SP.queue.length - 1));
-      S.callMusic.queue.forEach(t => { TRACK_INDEX[t.id] = t; });
-    }
-    SP.on = true;
-    if (!(SP.index >= 0 && SP.index < SP.queue.length)) SP.index = 0;
-    ensureHost();
-    const t = curTrack();
-    if (t && t.source === "audio" && t.url) playAudioTrack(t, SP.playing);
-    else if (t && t.source === "sc" && t.scUrl) loadSoundCloudTrack(t, SP.playing);
-    else if (t && t.source === "ytiframe" && t.ytId) playViaYouTubeIframe(t.ytId, SP.playing);
-    else if (t && t.ytId) loadYouTubeTrack(t.ytId, true);
-    if (!SP.tickI) SP.tickI = setInterval(tickSpotify, 250);
-    syncSpotify();
-    updateStage();
-    updateCtl();
-    toast(t ? "Music is active." : "Music mode on — search a track to start.", "ok");
-  }
-
-  function stopSpotify() {
-    if (SP.tickI) { clearInterval(SP.tickI); SP.tickI = null; }
-    pauseAudio();
-    if (audioEl) { audioEl.pause(); try { audioEl.removeAttribute("src"); audioEl.load(); } catch (e) {} }
-    pauseSoundCloud();
-    destroyYouTubePlayer();
-    scBaseUrl = "";
-    scWidget = null;
-    scWidgetReady = false;
-    const wasOn = SP.on;
-    SP.on = false; SP.playing = false; SP.openPanel = null;
-    if (wasOn) { syncSpotify(); updateCtl(); if (S.call) updateStage(); }
-  }
-
-  function toggleSpotify() {
-    if (!S.call) return toast("Join a call first.", "err");
-    if (SP.on) { stopSpotify(); return; }
-    startSpotify();
-  }
-
-  /* ======================= boot ======================= */
-  boot();
-
-  if (typeof window !== "undefined" && window.__HC_TEST__) {
-    window.__HC__ = {
-      S,
-      logs: () => playerLogs.slice(),
-      clearLogs: () => { playerLogs.length = 0; },
-      joinCall, leaveCall, startSpotify, stopSpotify, togglePlay, nextTrack, prevTrack,
-      resolveInvidiousCandidates, loadYouTubeTrack, playViaYouTubeIframe
-    };
-  }
-})();
