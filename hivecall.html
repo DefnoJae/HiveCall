@@ -362,6 +362,12 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
 .toast.ok .t-icon { color: var(--green); }
 .toast.err .t-icon { color: var(--red); }
 .toast.info .t-icon { color: var(--accent); }
+.toast.invite { pointer-events: auto; flex-wrap: wrap; padding: 11px 14px 11px 18px; }
+.toast.invite .t-msg { flex: 1 1 auto; min-width: 0; }
+.toast.invite .t-actions { flex: 0 0 auto; display: flex; gap: 8px; }
+.toast.invite .t-actions button { cursor: pointer; font: inherit; font-size: 12.5px; font-weight: 700; color: var(--tx); background: var(--bg-3); border: 1px solid var(--line-2); border-radius: 8px; padding: 6px 12px; }
+.toast.invite .t-actions button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.toast.invite .t-actions button:hover { filter: brightness(1.12); }
 
 .code-pill { display: flex; align-items: center; gap: 8px; background: var(--bg-2); border: 1px dashed var(--line-2); border-radius: 9px; padding: 9px 12px; font-size: 13px; user-select: all; }
 .code-pill code { font-weight: 800; letter-spacing: 2px; color: var(--tx); }
@@ -877,6 +883,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
         toast((me ? me.name : "A server member") + " invited you to the Voice Lounge" + (gg ? " in " + gg.name : "") + "!", "info");
       }
     });
+    ch.on("broadcast", { event: "music_invite" }, p => onMusicInvite(p, gid));
     ch.subscribe();
     hcChannels = [ch];
   }
@@ -1699,6 +1706,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     startCallTimer();
     startPresenceBeat();
     playChime();
+    scheduleMusicInviteCheck();
     toast("Joined " + g.name + " · Voice Lounge", "ok");
   }
 
@@ -2057,6 +2065,17 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     if (sbBtn) sbBtn.classList.toggle("on-accent", !!SB.open);
   }
 
+  /* A share reference is only worth a stage while it still carries a live
+     video track — a screen stream whose track has ended (or a WebRTC feed
+     torn down without firing "close") must not park the stage on the
+     "Waiting for the presentation stream…" placeholder. */
+  function hasLiveVideoTrack(stream) {
+    if (!stream || typeof stream.getVideoTracks !== "function") return false;
+    try {
+      return (stream.getVideoTracks() || []).some(t => t && t.readyState !== "ended");
+    } catch (e) { return false; }
+  }
+
   function updateStage() {
     const c = S.call;
     if (!c) return;
@@ -2067,17 +2086,25 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     const main = byId("stage-main");
     const strip = byId("stage-strip");
     if (!main) return;
+    // Clear dead share references before deciding what to render.
+    if (c.display && !hasLiveVideoTrack(c.display)) c.display = null;
+    if (c.remoteShare && !hasLiveVideoTrack(c.remoteShare.stream)) c.remoteShare = null;
+    const liveShare =
+      (c.display && hasLiveVideoTrack(c.display)) ||
+      (c.remoteShare && c.remoteShare.stream && hasLiveVideoTrack(c.remoteShare.stream));
     const tiles = g.call.map(id => tileFor(id)).join("");
-    if (c.share || c.remoteShare) {
+    if (liveShare) {
       main.classList.remove("music");
       main.classList.add("share");
       main.innerHTML = shareTile();
       strip.hidden = false;
       strip.innerHTML = tiles;
     } else if (SP.on) {
-      main.classList.remove("music");
-      main.classList.add("share");
-      main.innerHTML = shareTile();
+      main.classList.remove("share");
+      main.classList.add("music");
+      if (!byId("sp-root")) renderMusic();   // build the 3D carousel + dock once
+      updateCarousel();
+      updateDock();
       strip.hidden = false;
       strip.innerHTML = tiles;
     } else {
@@ -4184,6 +4211,88 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   }
   function togglePanel(which) { SP.openPanel = SP.openPanel === which ? null : which; refreshPanels(); updateDock(); }
 
+  /* ---------- listening-session invites ---------- */
+  function broadcastMusicInvite() {
+    const c = S.call;
+    if (!c || !supabaseClient) return;
+    const ch = getChannel(c.guildId);
+    if (!ch) return;
+    try {
+      ch.send({ type: "broadcast", event: "music_invite", payload: {
+        from: S.user.id, guildId: c.guildId,
+        music: { hostId: SP.hostId, restrict: SP.restrict, index: SP.index, queue: SP.queue, playing: SP.playing, pos: SP.pos, t0: Date.now(), volume: SP.volume }
+      } });
+    } catch (e) {}
+  }
+  function onMusicInvite(p, gid) {
+    p = broadcastPayload(p);
+    if (!p || !p.from || p.from === S.user.id) return;
+    if (!S.call || S.call.guildId !== gid) return;   // invites only count inside the call
+    if (SP.on) return;                               // already listening
+    const roster = (guilds()[gid] || {}).roster || {};
+    showMusicInviteToast(displayName(p.from, (roster[p.from] || {}).name), p.music);
+  }
+  const musicInviteState = { shownAt: 0 };
+  function showMusicInviteToast(hostName, musicState) {
+    const root = byId("toasts");
+    if (!root) return;
+    const now = Date.now();
+    if (now - musicInviteState.shownAt < 8000) return;   // one prompt at a time
+    musicInviteState.shownAt = now;
+    const el = document.createElement("div");
+    el.className = "toast invite";
+    el.innerHTML =
+      '<span class="t-icon">' + ic("info", 15) + "</span>" +
+      '<span class="t-msg"></span>' +
+      '<span class="t-actions">' +
+        '<button type="button" data-act="no">Not now</button>' +
+        '<button type="button" data-act="join" class="primary">Join</button>' +
+      "</span>";
+    el.querySelector(".t-msg").textContent = hostName + " started a listening session — Join?";
+    const close = () => { el.classList.remove("show"); setTimeout(() => el.remove(), 300); };
+    el.querySelector('[data-act="no"]').addEventListener("click", close);
+    el.querySelector('[data-act="join"]').addEventListener("click", () => { close(); joinMusicSession(musicState); });
+    root.appendChild(el);
+    requestAnimationFrame(() => el.classList.add("show"));
+    setTimeout(close, 12000);
+  }
+  /* Sync our queue, index, playback state and volume to the host's, then turn
+     music mode on (startSpotify adopts queue + index from S.callMusic). */
+  function joinMusicSession(musicState) {
+    if (!S.call || SP.on) return;
+    const m = musicState && typeof musicState === "object" && Array.isArray(musicState.queue) && musicState.queue.length
+      ? musicState
+      : (S.callMusic && Array.isArray(S.callMusic.queue) && S.callMusic.queue.length ? S.callMusic : null);
+    if (m) {
+      S.callMusic = m;
+      if (m.hostId) SP.hostId = m.hostId;   // the session host stays in charge
+      SP.restrict = !!m.restrict;
+      SP.volume = Math.max(0, Math.min(1, typeof m.volume === "number" ? m.volume : SP.volume));
+      SP.playing = !!m.playing;
+      SP.pos = m.pos || 0;
+    }
+    startSpotify();
+    // Mirror the host's volume onto already-live players (same as the volume slider).
+    if (audioEl) { try { audioEl.volume = SP.volume; } catch (e) {} }
+    if (ytPlayer && ytPlayerReady) { try { ytPlayer.setVolume(Math.round(SP.volume * 100)); } catch (e) {} }
+  }
+  /* Joined a call where a listening session is already running? Offer it ~1s
+     after landing (the music state rides in the presence snapshot "_music"). */
+  function scheduleMusicInviteCheck() {
+    musicInviteState.shownAt = 0;
+    const probe = delay => setTimeout(() => {
+      const c = S.call;
+      if (!c || SP.on) return;
+      const snap = ROSTER_MIRROR[c.guildId] || {};
+      const m = snap._music && typeof snap._music === "object" && Array.isArray(snap._music.queue) && snap._music.queue.length ? snap._music : null;
+      if (!m || !m.hostId || m.hostId === S.user.id) return;
+      const roster = (guilds()[c.guildId] || {}).roster || {};
+      showMusicInviteToast(displayName(m.hostId, (roster[m.hostId] || {}).name), m);
+    }, delay);
+    probe(1000);
+    probe(3000);   // one retry in case the presence snapshot was still loading
+  }
+
   /* ---------- session lifecycle ---------- */
   function startSpotify() {
     if (!S.call) return toast("Join a call first to start collaborative music.", "err");
@@ -4206,6 +4315,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     syncSpotify();
     updateStage();
     updateCtl();
+    broadcastMusicInvite();
     toast(t ? "Music is active." : "Music mode on — search a track to start.", "ok");
   }
 
