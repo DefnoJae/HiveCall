@@ -67,11 +67,8 @@
       const { data: mems } = await supabaseClient.from("server_members").select("server_id,user_id,user_name,user_color");
       if (!mems) return;
       const profiles = {};
-      mems.forEach(m => {
-        const cur = profiles[m.user_id];
-        if (!cur || !cur.name) profiles[m.user_id] = { id: m.user_id, name: m.user_name || "?", color: m.user_color || COLORS[0] };
-      });
-      if (S.user) profiles[S.user.id] = { id: S.user.id, name: S.user.name, color: S.user.color };
+      mems.forEach(m => { if (m.user_id) profiles[m.user_id] = ensureProfile(m.user_id, m.user_name, m.user_color); });
+      if (S.user) profiles[S.user.id] = ensureProfile(S.user.id, S.user.name, S.user.color);
       const ids = [...new Set(mems.map(m => m.server_id))];
       const servers = {};
       if (ids.length) {
@@ -98,9 +95,9 @@
 
   async function loadMembers(g) {
     try {
-      const { data } = await supabaseClient.from("server_members").select("user_id").eq("server_id", g.id);
-      g.members = (data || []).map(r => r.user_id);
-      (g.members || []).forEach(id => { if (!DB.profiles[id]) DB.profiles[id] = { id, name: id.slice(0, 8), color: COLORS[0] }; });
+      const { data } = await supabaseClient.from("server_members").select("user_id,user_name,user_color").eq("server_id", g.id);
+      g.members = (data || []).map(r => r.user_id).filter(Boolean);
+      (g.members || []).forEach(id => ensureProfile(id, null, null));
     } catch (e) { console.warn("loadMembers failed", e); }
   }
 
@@ -108,9 +105,7 @@
     try {
       const { data } = await supabaseClient.from("messages").select("*").eq("server_id", g.id).order("created_at", { ascending: true }).limit(300);
       g.chat = (data || []).map(m => mapMsgRow(m)).filter(Boolean);
-      (g.chat || []).forEach(m => {
-        if (m.authorId && !DB.profiles[m.authorId]) DB.profiles[m.authorId] = { id: m.authorId, name: m.authorName, color: m.authorColor };
-      });
+      (g.chat || []).forEach(m => { if (m.authorId) ensureProfile(m.authorId, m.authorName, m.authorColor); });
     } catch (e) { console.warn("loadChat failed", e); }
   }
   const mapMsgRow = r => r ? {
@@ -119,6 +114,7 @@
   } : null;
 
   /* Call presence: one row per server, active_users jsonb (roster + "_music"). */
+  const ROSTER_MIRROR = {};
   async function loadPresence(g) {
     try {
       const { data } = await supabaseClient.from("call_presence").select("server_id,active_users").eq("server_id", g.id).maybeSingle();
@@ -128,6 +124,7 @@
 
   function applyActiveUsers(g, obj, origin) {
     obj = obj && typeof obj === "object" ? obj : {};
+    ROSTER_MIRROR[g.id] = obj;
     const roster = {};
     let music = null;
     Object.keys(obj).forEach(k => {
@@ -135,10 +132,7 @@
       if (k === "_music" && v && typeof v === "object") { music = v; return; }
       if (!v || typeof v !== "object") return;
       roster[k] = v;
-      if (!DB.profiles[k]) DB.profiles[k] = { id: k, name: v.name || "?", color: v.color || COLORS[0] };
-      const p = DB.profiles[k];
-      if (v.name) p.name = v.name;
-      if (v.color) p.color = v.color;
+      ensureProfile(k, v.name, v.color);
     });
     g.call = Object.keys(roster);
     g.roster = roster;
@@ -236,11 +230,20 @@
   function appendChatMsg(r) {
     const g = guild(); if (!g || !r || r.server_id !== g.id) return;
     const m = mapMsgRow(r); if (!m) return;
-    const dup = (g.chat || []).some(x => x.id === m.id) ||
-      (g.chat || []).some(x => Math.abs((x.at || 0) - (m.at || 0)) < 2500 && x.authorId === m.authorId && x.text === m.text);
-    if (dup) return;
-    g.chat.push(m);
-    if (m.authorId && !DB.profiles[m.authorId]) DB.profiles[m.authorId] = { id: m.authorId, name: m.authorName, color: m.authorColor };
+    const chat = g.chat || (g.chat = []);
+    if (chat.some(x => x.id === m.id)) return;
+    // A locally optimistically-appended message has a temp id — swap it with the
+    // real database id so the Realtime echo never renders a second copy.
+    const tmpIdx = chat.findIndex(x => x.pending && x.authorId === m.authorId && x.text === m.text && Math.abs((x.at || 0) - (m.at || 0)) < 7000);
+    if (tmpIdx !== -1) {
+      const tmp = chat[tmpIdx];
+      tmp.id = m.id; tmp.pending = false; tmp.at = m.at;
+      if (m.authorName) tmp.authorName = m.authorName;
+      if (m.authorColor) tmp.authorColor = m.authorColor;
+      return;
+    }
+    chat.push(m);
+    if (m.authorId) ensureProfile(m.authorId, m.authorName, m.authorColor);
     const box = byId("chat-msgs");
     if (box && !S.modalOpen) {
       const wrap = document.createElement("div");
@@ -256,8 +259,38 @@
   const ANIM = ["Falcon", "Fox", "Otter", "Wolf", "Phoenix", "Raven", "Tiger", "Lynx", "Badger", "Hawk", "Eagle", "Owl", "Panther", "Sparrow", "Dolphin", "Cheetah", "Panda", "Raccoon", "Walrus", "Toucan", "Koala", "Gecko", "Sloth", "Mantis"];
   const randServerName = () => pick(ADJ) + " " + pick(ANIM);
 
+  /* ======================= profile normalization ======================= */
+  const fallbackName = id => "User " + String(id || "").slice(0, 6);
+  const isPlaceholder = n => !n || n === "?" || /^User([\s]|$)/i.test(String(n).trim());
+  function ensureProfile(id, name, color) {
+    if (!id) return null;
+    let p = DB.profiles[id];
+    const real = name && !isPlaceholder(name);
+    if (!p) {
+      p = DB.profiles[id] = { id, name: real ? name : fallbackName(id), color: color || COLORS[0] };
+    } else {
+      if (real) p.name = name;
+      else if (isPlaceholder(p.name)) p.name = fallbackName(id);
+      if (color) p.color = color;
+    }
+    if (!p.name || isPlaceholder(p.name)) p.name = fallbackName(id);
+    return p;
+  }
+  function displayName(id, fallback) {
+    const p = DB.profiles && DB.profiles[id];
+    if (p && p.name && !isPlaceholder(p.name)) return p.name;
+    if (fallback && !isPlaceholder(fallback)) return fallback;
+    return fallbackName(id);
+  }
+  function displayColor(id, fallback) {
+    const p = DB.profiles && DB.profiles[id];
+    if (p && p.color) return p.color;
+    return fallback || "#888";
+  }
+
   /* ======================= state ======================= */
   let S = { user: null, activeGuildId: null, activeChannel: "voice", call: null, devices: { audio: [], video: [] } };
+  let SESSION_TOKEN = null;
   let callTimerI = null;
   const guild = () => (S.activeGuildId ? guilds()[S.activeGuildId] : null);
 
@@ -411,14 +444,21 @@
       const m = $(".dropdown:not(.hidden)");
       if (m && !m.contains(e.target)) m.classList.add("hidden");
     });
-    window.addEventListener("beforeunload", () => { if (S.call) leaveCall(); });
+    window.addEventListener("pagehide", cleanupOnUnload);
     supabaseClient.auth.getSession().then(({ data }) => {
-      if (data.session && data.session.user) refreshAndGo(data.session.user);
-      else renderAuth();
+      if (data.session && data.session.user) {
+        SESSION_TOKEN = data.session.access_token || null;
+        refreshAndGo(data.session.user);
+      } else renderAuth();
     });
     supabaseClient.auth.onAuthStateChange((evt, session) => {
-      if (evt === "SIGNED_IN" && session) refreshAndGo(session.user);
-      else if (evt === "SIGNED_OUT") { if (!S.user) renderAuth(); }
+      if (evt === "SIGNED_IN" && session) {
+        SESSION_TOKEN = session.access_token || null;
+        refreshAndGo(session.user);
+      } else if (evt === "SIGNED_OUT") {
+        SESSION_TOKEN = null;
+        if (!S.user) renderAuth();
+      }
     });
   }
 
@@ -441,12 +481,15 @@
     if (!remoteUser) return renderAuth();
     const meta = remoteUser.user_metadata || {};
     const uid = remoteUser.id;
-    const name = meta.display_name || "User";
+    const email = remoteUser.email || "";
+    const clean = (meta && (meta.display_name || meta.name)) || "";
+    const name = (clean && clean.trim()) || (email && email.split("@")[0].trim()) || fallbackName(uid);
     const color = meta.color || COLORS[0];
-    S.user = { id: uid, name, color };
+    S.user = ensureProfile(uid, name, color);
+    supabaseClient.auth.getSession().then(({ data }) => { if (data && data.session) SESSION_TOKEN = data.session.access_token; });
     await refreshData();
     const p = DB.profiles[uid];
-    if (p && (!name || name === "User")) S.user.name = p.name || "User";
+    if (p && p.name && !isPlaceholder(p.name)) S.user.name = p.name;
     if (p && p.color) S.user.color = p.color;
     goHome();
   }
@@ -789,9 +832,8 @@
 
   function chatRowHTML(m) {
     if (m.system) return '<div class="msg system"><span class="sicon">' + ic("info", 15) + '</span><div class="m-text">' + esc(m.text) + ' <span class="m-time">' + time12(m.at) + "</span></div></div>";
-    const profile = users()[m.authorId];
-    const name = (profile && profile.name) || m.authorName || "?";
-    const color = (profile && profile.color) || m.authorColor || "#888";
+    const name = displayName(m.authorId, m.authorName);
+    const color = displayColor(m.authorId, m.authorColor);
     return '<div class="msg"><div class="avatar" style="width:38px;height:38px;background:' + color + '">' + esc(initials(name)) + '</div>' +
       '<div class="m-body"><div class="m-meta"><span class="m-name" style="color:' + color + '">' + esc(name) + '</span><span class="m-time">' + time12(m.at) + "</span></div>" +
       '<div class="m-text">' + esc(m.text) + "</div></div></div>";
@@ -824,22 +866,38 @@
       const text = input.value.trim();
       if (!text || !supabaseClient) return;
       clearTimeout(typT); typLastSent = 0; emitTyping(true);
-const me = S.user;
-    // Optimistic local append; realtime echo is deduped by id.
-    const m = { id: "m_" + Date.now(), authorId: me.id, authorName: me.name, authorColor: me.color, text, at: Date.now() };
-    g.chat.push(m);
-    const box = byId("chat-msgs");
-    if (box) {
-      const w = document.createElement("div");
-      w.innerHTML = chatRowHTML(m);
-      const n = w.firstElementChild;
-      if (n) { box.appendChild(n); box.scrollTop = box.scrollHeight; }
-    }
-    input.value = "";
-      await supabaseClient.from("messages").insert({
-        server_id: g.id, user_id: me.id, user_name: me.name, user_color: me.color, content: text,
-        created_at: new Date().toISOString()
-      }).then(({ error }) => { if (error) toast("Message failed: " + error.message, "err"); });
+      const me = S.user;
+      const localId = "m_" + Date.now() + "_" + Math.random().toString(36).slice(2, 6);
+      const m = { id: localId, pending: true, authorId: me.id, authorName: me.name, authorColor: me.color, text, at: Date.now() };
+      g.chat.push(m);
+      const box = byId("chat-msgs");
+      let node = null;
+      if (box) {
+        const w = document.createElement("div");
+        w.innerHTML = chatRowHTML(m);
+        node = w.firstElementChild;
+        if (node) { box.appendChild(node); box.scrollTop = box.scrollHeight; }
+      }
+      input.value = "";
+      try {
+        const { data, error } = await supabaseClient.from("messages").insert({
+          server_id: g.id, user_id: me.id, user_name: me.name, user_color: me.color, content: text,
+          created_at: new Date().toISOString()
+        }).select().single();
+        if (error) throw error;
+        const idx = g.chat.findIndex(x => x.id === localId);
+        if (idx !== -1) {
+          g.chat[idx].id = data && data.id ? data.id : g.chat[idx].id;
+          g.chat[idx].pending = false;
+          const t = data && Date.parse(data.created_at);
+          if (!isNaN(t)) g.chat[idx].at = t;
+        }
+      } catch (err) {
+        const idx = g.chat.findIndex(x => x.id === localId);
+        if (idx !== -1) g.chat.splice(idx, 1);
+        if (node && node.parentNode) node.parentNode.removeChild(node);
+        toast("Message failed: " + ((err && err.message) || "unknown error"), "err");
+      }
     };
     byId("chat-send").addEventListener("click", send);
     input.addEventListener("keydown", e => { if (e.key === "Enter") send(); });
@@ -886,7 +944,7 @@ const me = S.user;
   function voiceHTML(g) {
     const inCallIds = g.call || [];
     const inCallUsers = inCallIds.map(id => users()[id]).filter(Boolean);
-    const alreadyIn = inCallIds.includes(S.user.id);
+    const inMyCall = !!(S.call && S.call.guildId === g.id);
     const chips = inCallUsers.length
       ? inCallUsers.map(u => {
           const self = u.id === S.user.id;
@@ -901,9 +959,8 @@ const me = S.user;
         "<span>" + inCallUsers.length + " voice participant" + (inCallUsers.length === 1 ? "" : "s") + "</span></div>" +
       '<div class="voice-people">' + chips + "</div>" +
       '<div class="voice-actions">' +
-        (alreadyIn
-          ? '<button class="btn btn-ghost" id="v-open" disabled>' + ic("check", 17) + " You are connected</button>" +
-            '<button class="btn btn-green" id="v-open2">' + ic("voice", 17) + " Open call</button>"
+        (inMyCall
+          ? '<button class="btn btn-green" id="v-open2">' + ic("voice", 17) + " Return to call</button>"
           : '<button class="btn btn-green" id="v-join">' + ic("voice", 17) + " Join call</button>") +
         '<button class="btn btn-ghost" id="v-invite">' + ic("userPlus", 17) + " Invite</button>" +
       "</div>" +
@@ -939,7 +996,14 @@ const me = S.user;
   function joinCall() {
     const g = guild();
     if (!g || !S.user || !supabaseClient) return;
-    if (S.call) return;
+    // Already connected in this server's call → just bring the overlay back.
+    if (S.call) {
+      if (S.call.guildId === g.id) {
+        renderCall();
+        toast("Returned to the call.", "info");
+      }
+      return;
+    }
     if (SP.on) stopSpotify();
     const now = Date.now();
     S.call = {
@@ -982,6 +1046,33 @@ const me = S.user;
     if (callTimerI) { clearInterval(callTimerI); callTimerI = null; }
     goHome();
     toast("You left the call.", "info");
+  }
+
+  /* ---------------- disconnect cleanup (tab close / navigation) ---------------- */
+  function beaconPresence(gid) {
+    if (!supabaseClient || !S.user || gid == null) return;
+    const bak = ROSTER_MIRROR[gid];
+    if (!bak) return;   // nothing known locally → skip (leaveCall path already handled)
+    let next = bak;
+    try { next = JSON.parse(JSON.stringify(bak)); } catch (e) { return; }
+    delete next[S.user.id];
+    if (next._music && S.callMusic && S.callMusic.hostId === S.user.id) delete next._music;
+    const url = SUPABASE_URL.replace(/\/+$/, "") + "/rest/v1/call_presence";
+    let body;
+    try { body = JSON.stringify({ server_id: gid, active_users: next }); } catch (e) { return; }
+    const opt = {
+      method: "POST", keepalive: true, body,
+      headers: { "Content-Type": "application/json", "apikey": SUPABASE_ANON_KEY, "Authorization": "Bearer " + (SESSION_TOKEN || SUPABASE_ANON_KEY), "Prefer": "resolution=merge-duplicates" }
+    };
+    try { fetch(url + "?on_conflict=server_id", opt).catch(() => {}); } catch (e) {}
+  }
+  function cleanupOnUnload() {
+    try {
+      if (peer && !peer.destroyed) peer.destroy();
+    } catch (e) {}
+    const c = S.call;
+    if (c) beaconPresence(c.guildId);   // remove self from active_users
+    SB.open = false;
   }
 
   /* ---------------- PeerJS mesh ---------------- */
@@ -1042,14 +1133,15 @@ const me = S.user;
     let r = c.remote[uid];
     if (!r) r = c.remote[uid] = { stream: new MediaStream(), video: false, audio: false, watching: false };
     src.getTracks().forEach(t => {
-      const cur = t.kind === "audio" ? r.stream.getAudioTracks() : r.stream.getVideoTracks();
-      const want = t.kind === "video" ? r.video : r.audio;
-      if (!cur.length) r.stream.addTrack(t);
-      else if (t.kind === "video" && !r.video) { r.stream.removeTrack(cur[0]); r.stream.addTrack(t); }
+      const isA = t.kind === "audio";
+      const cur = isA ? r.stream.getAudioTracks() : r.stream.getVideoTracks();
+      cur.forEach(x => { if (x !== t) try { r.stream.removeTrack(x); } catch (e) {} });
+      if (!r.stream.getTracks().some(x => x === t)) r.stream.addTrack(t);
     });
-    if (src.getVideoTracks().length) r.video = true;
-    if (src.getAudioTracks().length) r.audio = true;
+    r.video = src.getVideoTracks().length > 0;
+    r.audio = src.getAudioTracks().length > 0;
     if (!r.watching && r.audio) { r.watching = true; watchTalkLevel(src, uid); }
+    if (r.watching && !r.audio) { r.watching = false; unwatchTalkLevel(uid); }
     updateStage();
   }
   function cleanupRemote(uid) {
@@ -1202,7 +1294,7 @@ const me = S.user;
       // top and is revealed only when their actual WebRTC video track arrives.
       body = fill + '<video id="vm-' + id + '" autoplay playsinline hidden></video>';
     }
-    return '<div class="tile' + (self ? '' : '') + '"' + (self ? ' id="tile-self"' : ' id="tile-' + id + '"') + '">' +
+    return '<div class="tile' + (self ? '' : '') + '" data-user-id="' + id + '"' + (self ? ' id="tile-self"' : ' id="tile-' + id + '"') + '">' +
       body +
       (!self && !camOn ? '<div class="tile-camoff">' + ic("camOff", 15) + "</div>" : "") +
       '<div class="tile-tag"><span class="mic-badge ' + (micOn ? "on" : "off") + '">' + ic(micOn ? "mic" : "micOff", 13) + '</span><span>' + esc(u.name) + (self ? "  (you)" : "") + "</span></div>" +
@@ -1243,23 +1335,27 @@ const me = S.user;
     const tv = byId("vm-self");
     if (tv && c.stream && c.cam) {
       if (tv.srcObject !== c.stream) tv.srcObject = c.stream;
+      playMedia(tv);
       tv.hidden = false;
-    } else if (tv) tv.hidden = true;
+    } else if (tv) { tv.hidden = true; tv.srcObject = null; }
     Object.keys(c.remote || {}).forEach(uid => {
       const el = byId("vm-" + uid);
       const r = c.remote[uid];
       const camOn = roster[uid] ? !!roster[uid].cam : true;
       if (el && r && r.video && camOn) {
         if (el.srcObject !== r.stream) el.srcObject = r.stream;
+        playMedia(el);
         el.hidden = false;
-      } else if (el) el.hidden = true;
+      } else if (el) { el.hidden = true; el.srcObject = null; }
     });
     const sv = byId("share-video");
     const shareStream = c.display || (c.remoteShare ? c.remoteShare.stream : null);
     if (sv && shareStream) {
       if (sv.srcObject !== shareStream) sv.srcObject = shareStream;
+      sv.muted = !!c.share;          // mute own screen-share preview (echo)
+      playMedia(sv);
       sv.hidden = false;
-    } else if (sv) sv.hidden = true;
+    } else if (sv) { sv.hidden = true; sv.srcObject = null; }
   }
 
   function bootMedia() {
@@ -1435,9 +1531,12 @@ const me = S.user;
       return toast("Screen share is not supported in this browser.", "err");
     }
     try {
-      const s = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+      const s = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       c.display = s; c.share = true;
-      s.getVideoTracks()[0].addEventListener("ended", () => stopShare(true));
+      const vt = s.getVideoTracks()[0];
+      if (vt) vt.addEventListener("ended", () => stopShare(true));
+      const at = s.getAudioTracks()[0];
+      if (at) at.addEventListener("ended", () => stopShare(true));
       startShareRemote(s);
       pushPresence();
       updateStage(); updateCtl();
@@ -1459,9 +1558,13 @@ const me = S.user;
     toast(auto ? "Screen share ended." : "You stopped sharing.", "info");
   }
 
-  /* ---------- live talking activity ring (mic level driven) ---------- */
   /* ---------- talking activity rings (local analysis, per user) ---------- */
   const _watch = {};
+  const tileEl = uid => document.querySelector('.tile[data-user-id="' + uid + '"]') || byId(uid === S.user.id ? "tile-self" : "tile-" + uid);
+  function playMedia(el) {
+    if (!el || !el.play) return;
+    el.play().catch(() => {});
+  }
   function watchTalkLevel(src, uid, onLevel) {
     unwatchTalkLevel(uid);
     const c = S.call;
@@ -1475,12 +1578,18 @@ const me = S.user;
       ctx.createMediaStreamSource(src).connect(analyser);
     } catch (e) { return; }
     const resume = () => { if (ctx && ctx.state === "suspended") { try { ctx.resume(); } catch (e) {} } };
-    if (typeof onLevel === "function") resume(); else document.addEventListener("click", resume);
+    if (typeof onLevel === "function") {
+      resume();
+    } else {
+      // Remote watcher: suspend stays until a user gesture on page; attach
+      // a one-time pointerdown resume AND a click resume to be safe.
+      document.addEventListener("click", resume);
+      document.addEventListener("pointerdown", resume, { once: true });
+    }
     const buf = new Float32Array(analyser.fftSize);
     let smooth = 0;
     const watcher = { ctx, analyser, talking: false, int: 0, resume };
     _watch[uid] = watcher;
-    const elId = uid === S.user.id ? "tile-self" : "tile-" + uid;
     const tick = () => {
       if (!S.call || !_watch[uid]) { unwatchTalkLevel(uid); return; }
       try { analyser.getFloatTimeDomainData(buf); } catch (e) { unwatchTalkLevel(uid); return; }
@@ -1493,7 +1602,7 @@ const me = S.user;
       if (typeof onLevel === "function") {
         onLevel(watcher.int);
       } else {
-        const el = byId(elId);
+        const el = tileEl(uid);
         if (el) {
           el.classList.toggle("talking", watcher.talking);
           const av = $(".tile-avatar", el);
@@ -1508,14 +1617,14 @@ const me = S.user;
     const w = _watch[uid];
     if (!w) return;
     if (w.raf) cancelAnimationFrame(w.raf);
-    if (w.resume) document.removeEventListener("click", w.resume);
+    if (w.resume) { document.removeEventListener("click", w.resume); document.removeEventListener("pointerdown", w.resume); }
     if (w.ctx) { try { w.ctx.close(); } catch (e) {} }
     delete _watch[uid];
-    const el = byId(uid === S.user.id ? "tile-self" : "tile-" + uid);
+    const el = tileEl(uid);
     if (el) { el.classList.remove("talking"); const av = $(".tile-avatar", el); if (av) av.style.removeProperty("--talk-int"); }
   }
   function applySelfTalk(int) {
-    const el = byId("tile-self");
+    const el = tileEl(S.user.id);
     if (!el) return;
     el.classList.toggle("talking", int > 0.3);
     const av = $(".tile-avatar", el);
