@@ -16,34 +16,18 @@
   const djb2 = s => { let h = 5381; for (const c of s) h = ((h << 5) + h + c.charCodeAt(0)) | 0; return "h" + (h >>> 0).toString(36); };
 
   /* ======================= Supabase + PeerJS setup ======================= */
-  /* Required (already provisioned, per the agreed schema):
-       servers(id, name, owner_id, invite_code)
-       server_members(server_id, user_id)  — composite PK (server_id, user_id)
-       messages(id, server_id, user_id, user_name, user_color, content, created_at)
-       call_presence(server_id, active_users jsonb)  — one row per server; keeps the roster + "_music"
-       soundboard(id, server_id, user_id, name, emoji, data_url, created_at)
-     Display names/colors come from auth.users user_metadata (display_name, color)
-     and from the user_name/user_color columns on messages + call_presence roster.
-     Real-time must be enabled for: messages, call_presence, soundboard (+ broadcast).
-     Realtime channel "hc-<server_id>" uses broadcasts: sb_play, kick, invite.
-     RLS with the anon key must allow the row ops the app performs. */
   const SUPABASE_URL = "https://xheyslqfzvidoaczlmxz.supabase.co";
   const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhoZXlzbHFmenZpZG9hY3psbXh6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkzNTIwNTQsImV4cCI6MjEwNDkyODA1NH0.1r1B2H0_51wTDxoaj8v4XF8SYZTsSoiDj42i94hPVyg";
   const supabaseClient = (window.supabase && window.supabase.createClient)
     ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
     : null;
 
-  /* Optimistic runtime mirrors — filled from Supabase by refreshData().
-     guilds() = servers keyed by id (with .members/.call/.chat mirrors),
-     users()  = profiles (name/color) keyed by Supabase user id. */
   let DB = { servers: {}, profiles: {}, soundboards: {} };
   const guilds = () => DB.servers;
   const users = () => DB.profiles;
   const saveGuilds = ob => { DB.servers = ob || DB.servers; };
   const saveUsers = ob => { DB.profiles = ob || DB.profiles; };
 
-  /* Device-local prefs ONLY (resolution caches, api keys, settings).
-     No accounts, servers, messages, or calls live in localStorage any more. */
   const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } };
   const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
   const prefs = () => lsGet("hc_prefs", { autoMute: false, sounds: true, micId: "", camId: "" });
@@ -60,7 +44,6 @@
     createdAt: Date.parse(r.created_at || 0) || 0
   });
 
-  /* Server + profile mirror: servers we belong to, plus every member's (name,color). */
   async function refreshData() {
     if (!supabaseClient || !S.user) return;
     try {
@@ -82,7 +65,7 @@
       DB.profiles = profiles;
       const g = servers[S.activeGuildId];
       if (g) await loadServerData(g);
-      return g ? Object.values(servers) : Object.values(servers);
+      return Object.values(servers);
     } catch (e) { console.warn("refreshData failed", e); }
   }
 
@@ -113,7 +96,6 @@
     text: r.content, at: Date.parse(r.created_at) || Date.now()
   } : null;
 
-  /* Call presence: one row per server, active_users jsonb (roster + "_music"). */
   const ROSTER_MIRROR = {};
   async function loadPresence(g) {
     try {
@@ -136,10 +118,6 @@
       roster[k] = v;
       ensureProfile(k, v.name, v.color);
     });
-    // "active_users" is a read-modify-write JSON blob, so two people writing
-    // presence at the same moment can briefly clobber each other. Never drop
-    // ourselves, or a peer we hold an open WebRTC connection to, on a realtime
-    // update: that is what made people look kicked out of the call.
     if (origin === "rt" && S.call && S.call.guildId === g.id) {
       if (S.user && !roster[S.user.id]) {
         const mine = users()[S.user.id] || { name: S.user.name, color: S.user.color };
@@ -159,7 +137,6 @@
     }
     g.call = Object.keys(roster);
     g.roster = roster;
-    // Anyone who is no longer in the call loses their green speaking ring too.
     Object.keys(talkState).forEach(uid => { if (!roster[uid]) clearTalkState(uid); });
     if (music && music.queue) S.callMusic = music;
     if (origin === "rt" && S.call && S.call.guildId === g.id) {
@@ -175,8 +152,6 @@
       prevCall.filter(id => !((roster[id] || {}).share) && !!((prevRoster[id] || {}).share)).forEach(id => {
         toast(displayName(id, prevRoster[id] && prevRoster[id].name) + " stopped sharing their screen.", "info");
       });
-      // Show "X is presenting" as soon as presence says so, even before the
-      // screen media connection has finished negotiating.
       if (S.call.sharePending) {
         Object.keys(roster).forEach(id => {
           if (id === S.user.id) return;
@@ -185,12 +160,16 @@
         });
       }
     }
+    // A2: newly-joining user notification — someone in the call already has
+    // music running and we just joined, so offer to join the session.
+    if (origin === "rt" && S.call && S.call.guildId === g.id && music && music.queue && music.playing && !SP.on && S.call.joinAt && Date.now() - S.call.joinAt < 6000) {
+      onMusicInvite({ hostId: music.hostId, queue: music.queue, index: music.index, pos: music.pos, volume: music.volume });
+    }
     if (origin !== "local" && S.call && S.call.guildId === g.id) {
       if (music && music.queue && SP.on) applySpotifySync(music);
-      // Dial users we aren't connected to yet (lower-id initiates to avoid double-dials).
       if (peerOpen && S.call && S.call.guildId === g.id) {
         g.call.forEach(id => { if (id !== S.user.id && S.user.id < id) callUser(id); });
-        if (S.call.share) ensureShareMesh();     // late joiners get the screen share too
+        if (S.call.share) ensureShareMesh();
       }
       if (byId("call-view")) {
         const added = g.call.some(id => !prevCall.includes(id));
@@ -217,14 +196,10 @@
     } catch (e) { console.warn("loadSoundboard failed", e); }
   }
 
-  /* Presence writes are read-merge-write and serialized so concurrent toggles
-     from in-call users don't clobber each other. */
   let presenceQueue = Promise.resolve();
   function writePresence(gid, patch) {
     if (!supabaseClient || !gid) return;
     presenceQueue = presenceQueue.then(async () => {
-      // Read-modify-write races with other clients, so retry once instead of
-      // silently losing our own roster entry.
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           const { data } = await supabaseClient.from("call_presence").select("server_id,active_users").eq("server_id", gid).maybeSingle();
@@ -241,9 +216,6 @@
     });
   }
 
-  /* Instant (broadcast) mic/cam/share state propagation — mirrors pushPresence
-     without waiting for the DB roundtrip. DB presence still records the state
-     for anyone who joins later. */
   function sendState() {
     const c = S.call;
     if (!c || !S.user || !supabaseClient) return;
@@ -256,8 +228,6 @@
       } });
     } catch (e) {}
   }
-  /* In-place tile refresh — patches a single tile's mic badge / camera state
-     without recreating the DOM (keeps <audio> streams playing seamlessly). */
   function updateTileFor(uid) {
     const c = S.call; if (!c) return;
     const g = guilds()[c.guildId]; if (!g) return;
@@ -303,11 +273,12 @@
     r.cam = !!p.cam;
     r.share = !!p.share;
     if (p.name || p.color) ensureProfile(p.from, p.name, p.color);
-    // "X is presenting" needs to appear instantly (the DB presence event lags).
     if (S.call.sharePending) {
       if (r.share && !prevShare) S.call.sharePending[p.from] = true;
       if (!r.share) delete S.call.sharePending[p.from];
     }
+    // A4: share priority — if a peer starts sharing, kill music on our side too.
+    if (r.share && !prevShare && SP.on) stopSpotify();
     if (byId("call-view")) {
       if (r.share !== prevShare) updateStage();
       else updateTileFor(p.from);
@@ -328,7 +299,6 @@
     });
   }
 
-  /* Real-time channels: messages, call_presence, soundboard + broadcast. */
   let hcChannels = [];
   function closeRealtime() { hcChannels.forEach(ch => { try { supabaseClient.removeChannel(ch); } catch (e) {} }); hcChannels = []; }
   function getChannel(gid) { return hcChannels.find(ch => ch.topic === "hc-" + gid) || null; }
@@ -349,6 +319,18 @@
     ch.on("broadcast", { event: "state" }, p => onStateBroadcast(p));
     ch.on("broadcast", { event: "talk" }, p => onTalkBroadcast(p));
     ch.on("broadcast", { event: "typing" }, p => onTyping(p));
+    // A2: someone started a music session — offer to join.
+    ch.on("broadcast", { event: "music_invite" }, p => onMusicInvite(broadcastPayload(p)));
+    // A4: someone started screen sharing — music stops everywhere.
+    ch.on("broadcast", { event: "music_stop" }, p => {
+      p = broadcastPayload(p);
+      if (!S.call || S.call.guildId !== gid) return;
+      if (p.from === S.user.id) return;
+      if (SP.on) {
+        logPlayer("info", "Music stopped: " + (displayName(p.from, null) || "someone") + " started a screen share.");
+        stopSpotify();
+      }
+    });
     ch.on("broadcast", { event: "kick" }, message => { const p = broadcastPayload(message); if (S.call && S.call.guildId === gid && p.userId && p.userId === S.user.id) { toast("You were disconnected by a server member.", "err"); leaveCall(); } });
     ch.on("broadcast", { event: "invite" }, p => {
       p = broadcastPayload(p);
@@ -380,8 +362,6 @@
     const m = mapMsgRow(r); if (!m) return;
     const chat = g.chat || (g.chat = []);
     if (chat.some(x => x.id === m.id)) return;
-    // A locally optimistically-appended message has a temp id — swap it with the
-    // real database id so the Realtime echo never renders a second copy.
     const tmpIdx = chat.findIndex(x => x.pending && x.authorId === m.authorId && x.text === m.text && Math.abs((x.at || 0) - (m.at || 0)) < 7000);
     if (tmpIdx !== -1) {
       const tmp = chat[tmpIdx];
@@ -508,7 +488,6 @@
     setTimeout(() => { el.classList.remove("show"); setTimeout(() => el.remove(), 300); }, 2800);
   }
 
-  /* ======================= modal helpers ======================= */
   function showModal(html) {
     byId("root-modal").innerHTML = '<div class="modal-back" id="modal-back">' + html + "</div>";
     S.modalOpen = true;
@@ -582,9 +561,6 @@
 
   /* ======================= auth ======================= */
   function boot() {
-    // Force resolvers to be considered "down" on first load so every track
-    // plays instantly via YouTube IFrame. Re-enable probing with the
-    // "↻ Retry resolvers now" button in the Playback Logs panel.
     if (localStorage.getItem(RESOLVER_CACHE_KEY) === null) markResolverDown();
     if (!supabaseClient) { renderConfigError(); return; }
     document.addEventListener("keydown", e => { if (e.key === "Escape" && S.modalOpen) closeModal(); });
@@ -594,12 +570,8 @@
     });
     window.addEventListener("pagehide", e => cleanupOnUnload(e));
     window.addEventListener("beforeunload", () => cleanupOnUnload({ persisted: false }));
-    // Backgrounding a tab/app is not leaving the call: re-assert presence and
-    // wake frozen media up again as soon as the page is visible/focused.
     document.addEventListener("visibilitychange", () => { if (!document.hidden) onPageResumed(); });
     window.addEventListener("focus", () => onPageResumed());
-    // Media playback and talking-ring analysers may be blocked until the page
-    // has a user gesture — every gesture is a chance to start them.
     ["click", "pointerdown", "keydown", "touchstart"].forEach(ev =>
       document.addEventListener(ev, () => { resumeTalkContexts(); kickMediaPlayback(); }, true));
     supabaseClient.auth.getSession().then(({ data }) => {
@@ -625,7 +597,6 @@
         "<h2>Missing Supabase config</h2>" +
         '<p class="sub">Open ' + esc(new URLSearchParams(location.search).get("f") || "app.js (source)") +
         ' and replace <b>SUPABASE_URL</b> and <b>SUPABASE_ANON_KEY</b> at the top with your project values.</p>' +
-        '<p class="sub">The Supabase and PeerJS CDN scripts are already in the &lt;head&gt; of hivecall.html.</p>' +
       "</div></div></div>";
   }
 
@@ -746,7 +717,6 @@
       goHome();
       toast("Welcome to HiveCall, " + name + "!", "ok");
     } else {
-      // Email confirmation enabled in Supabase — ask the user to confirm.
       byId("auth-form").innerHTML =
         '<h2>Check your email</h2>' +
         '<p class="sub">We sent a confirmation link to <b>' + esc(email) + '</b>. Confirm it, then sign in.</p>' +
@@ -761,7 +731,6 @@
     if (!email || !pass) return authError("Enter your email and password.");
     const { error } = await supabaseClient.auth.signInWithPassword({ email, password: pass });
     if (error) return authError(error.message);
-    // onAuthStateChange(SIGNED_IN) → refreshAndGo → goHome
     toast("Signed in.", "ok");
   }
 
@@ -797,7 +766,6 @@
       name: name || randServerName(), owner_id: S.user.id, invite_code: invite
     }).select().single();
     if (error || !data) { toast("Could not create the server (" + (error ? error.message : "no row") + ").", "err"); return null; }
-    // Membership (carries name/color so member lists work everywhere).
     await upsertMember(data.id);
     const g = mapServerRow(data);
     g.members = [S.user.id];
@@ -1061,7 +1029,6 @@
     input.addEventListener("keydown", e => { if (e.key === "Enter") send(); });
   }
 
-  /* ---------- typing indicators (broadcast "typing" + 2.5s throttle, 4s expiry) ---------- */
   let typers = {}, typLastSent = 0, typTimer = null;
   function typingHTML() {
     const me = (S.user && S.user.id) || "";
@@ -1155,7 +1122,6 @@
   function joinCall() {
     const g = guild();
     if (!g || !S.user || !supabaseClient) return;
-    // Already connected in this server's call → just bring the overlay back.
     if (S.call) {
       if (S.call.guildId === g.id) {
         renderCall();
@@ -1170,7 +1136,6 @@
       stream: null, display: null, hasMedia: false, shareWaiting: false,
       peers: {}, shareMc: {}, soundMc: [], soundLocal: [], soundRemote: [], remote: {}, remoteShare: null, sharePending: {}
     };
-    // Reflect self in the roster immediately (locally + Supabase).
     g.roster = g.roster || {};
     g.roster[S.user.id] = { name: S.user.name, color: S.user.color, mic: false, cam: false, share: false, joinedAt: now };
     if (!g.call.includes(S.user.id)) g.call.push(S.user.id);
@@ -1182,14 +1147,16 @@
     startPresenceBeat();
     playChime();
     toast("Joined " + g.name + " · Voice Lounge", "ok");
+    // A2: if music was already running when we joined, offer it now.
+    if (S.callMusic && S.callMusic.queue && S.callMusic.queue.length && S.callMusic.playing && !SP.on) {
+      setTimeout(() => onMusicInvite(S.callMusic), 800);
+    }
   }
 
   function leaveCall() {
     const c = S.call;
     if (!c) return;
     const gid = c.guildId;
-    // Stop every stream/element we own *before* the call view is discarded:
-    // detached media elements keep playing otherwise.
     releaseCallMedia();
     stopPresenceBeat();
     Object.keys(c.peers || {}).forEach(k => { try { c.peers[k].close(); } catch (e) {} });
@@ -1216,11 +1183,10 @@
     toast("You left the call.", "info");
   }
 
-  /* ---------------- disconnect cleanup (tab close / navigation) ---------------- */
   function beaconPresence(gid) {
     if (!supabaseClient || !S.user || gid == null) return;
     const bak = ROSTER_MIRROR[gid];
-    if (!bak) return;   // nothing known locally → skip (leaveCall path already handled)
+    if (!bak) return;
     let next = bak;
     try { next = JSON.parse(JSON.stringify(bak)); } catch (e) { return; }
     delete next[S.user.id];
@@ -1235,25 +1201,17 @@
     try { fetch(url + "?on_conflict=server_id", opt).catch(() => {}); } catch (e) {}
   }
   function cleanupOnUnload(e) {
-    // A bfcache/background page has not really been left — only tear the call
-    // down (and remove ourselves from presence) on a real unload.
     if (e && e.persisted) return;
-    try {
-      if (peer && !peer.destroyed) peer.destroy();
-    } catch (e2) {}
+    try { if (peer && !peer.destroyed) peer.destroy(); } catch (e2) {}
     const c = S.call;
-    if (c) { releaseCallMedia(); beaconPresence(c.guildId); }   // remove self from active_users
+    if (c) { releaseCallMedia(); beaconPresence(c.guildId); }
     stopPresenceBeat();
     SB.open = false;
   }
 
-  /* ---------------- staying connected (switching tabs ≠ leaving) ---------------- */
   let presenceBeatI = null;
   function startPresenceBeat() {
     stopPresenceBeat();
-    // Re-assert our roster entry: a raced/clobbered presence write (or a
-    // backgrounded page) would otherwise leave us "kicked" until the next
-    // mic/cam/share toggle.
     presenceBeatI = setInterval(() => {
       if (!S.call) { stopPresenceBeat(); return; }
       pushPresence();
@@ -1269,8 +1227,6 @@
     tryMesh();
     ensureShareMesh();
   }
-  /* Browsers refuse to autoplay until the page has a gesture — retry any call
-     media that stayed frozen (silent call, black screen share). */
   function kickMediaPlayback() {
     const c = S.call;
     if (!c) return;
@@ -1284,9 +1240,6 @@
     if (sv && sv.srcObject && !sv.muted && sv.paused) stale = true;
     if (stale) attachMedia();
   }
-  /* A detached <audio>/<video> keeps playing after the call view is torn down,
-     which is why people could still hear the call after they left. Release
-     every stream explicitly. */
   function releaseCallMedia() {
     $$("audio, video").forEach(el => {
       if (!el.closest || !el.closest("#call-view")) return;
@@ -1316,7 +1269,6 @@
   }
   function setInCallFlag() { try { document.body.classList.toggle("in-call", !!S.call); } catch (e) {} }
 
-  /* ---------------- PeerJS mesh ---------------- */
   let peer = null, peerOpen = false, peerError = false;
   function getPeer() {
     if (typeof window.Peer === "undefined") {
@@ -1330,8 +1282,6 @@
     peerError = false;
     peer = new window.Peer(S.user.id, { debug: 1 });
     peer.on("open", () => { peerOpen = true; tryMesh(); ensureShareMesh(); });
-    // The signalling socket drops whenever a tab sleeps — reconnect instead of
-    // staying silently deaf for the rest of the call.
     peer.on("disconnected", () => { if (S.call) { try { peer.reconnect(); } catch (e) {} } });
     peer.on("close", () => { peerOpen = false; });
     peer.on("error", e => { peerError = true; if (e && e.type === "unavailable-id") console.warn("peer id conflict", e); });
@@ -1342,7 +1292,6 @@
     const c = S.call;
     if (!c || !c.stream || !peerOpen) return;
     const roster = (guilds()[c.guildId] || {}).call || [];
-    // Lower-id side initiates so we never double-dial the same pair.
     roster.forEach(id => { if (id !== S.user.id && S.user.id < id) callUser(id); });
   }
   function callUser(uid) {
@@ -1363,9 +1312,6 @@
     const kind = mc.metadata && mc.metadata.kind ? mc.metadata.kind : "";
     const roster = (guilds()[c.guildId] || {}).roster || {};
     const haveMain = !!(c.peers[uid] && c.peers[uid].open);
-    // Sound-board clips arrive on their own media connection and must be routed
-    // before the screen-share heuristic, otherwise a clip played by someone who
-    // is sharing their screen would be mistaken for the share stream.
     if (kind === "sound") {
       try { mc.answer(); } catch (e) {}
       if (soundWait[uid]) { clearTimeout(soundWait[uid]); delete soundWait[uid]; }
@@ -1426,8 +1372,6 @@
     pruneIfGone(uid);
     updateStage();
   }
-  /* Presence can lag behind the media connection: once a peer's connection has
-     closed and the shared roster no longer lists them, drop them locally too. */
   function pruneIfGone(uid) {
     const c = S.call;
     if (!c || !uid || uid === S.user.id) return;
@@ -1460,8 +1404,6 @@
     });
     return dialed;
   }
-  /* Screen share rides one media connection per viewer, so re-dial whenever a
-     viewer connects or joins the call later. */
   function ensureShareMesh() {
     const c = S.call;
     if (!c || !c.share || !c.display || !peerOpen || !peer) return;
@@ -1539,6 +1481,13 @@
     if (sbBtn) sbBtn.classList.toggle("on-accent", !!SB.open);
   }
 
+  /* =========================================================================
+     updateStage — THE FIX LIVES HERE.
+     The share branch now requires an ACTUAL stream (c.display or
+     c.remoteShare.stream) instead of any truthy share flag, and the SP.on
+     branch finally calls renderMusic() instead of painting the share
+     placeholder. This is why the carousel was never showing.
+     ========================================================================= */
   function updateStage() {
     const c = S.call;
     if (!c) return;
@@ -1550,16 +1499,17 @@
     const strip = byId("stage-strip");
     if (!main) return;
     const tiles = g.call.map(id => tileFor(id)).join("");
-    if (c.share || c.remoteShare) {
+    const activeShareStream = c.display || (c.remoteShare && c.remoteShare.stream) || null;
+    if (activeShareStream) {
       main.classList.remove("music");
       main.classList.add("share");
       main.innerHTML = shareTile();
       strip.hidden = false;
       strip.innerHTML = tiles;
     } else if (SP.on) {
-      main.classList.remove("music");
-      main.classList.add("share");
-      main.innerHTML = shareTile();
+      main.classList.remove("share");
+      main.classList.add("music");
+      renderMusic();
       strip.hidden = false;
       strip.innerHTML = tiles;
     } else {
@@ -1595,7 +1545,6 @@
     if (self) {
       body = (hasVideo ? '<video id="vm-self" autoplay playsinline muted></video>' : fill);
     } else {
-      // Separate <audio> and <video> so audio playback is never killed by hiding the video element.
       body = fill +
         '<audio id="va-' + id + '" autoplay playsinline hidden></audio>' +
         '<video id="vm-' + id + '" autoplay playsinline hidden></video>';
@@ -1643,24 +1592,20 @@
     const c = S.call;
     if (!c) return;
     const roster = (guilds()[c.guildId] || {}).roster || {};
-    // --- local self tile (muted, video only — audio plays through speakers via separate element) ---
     const tv = byId("vm-self");
     if (tv && c.stream && c.cam) {
       if (tv.srcObject !== c.stream) tv.srcObject = c.stream;
       playMedia(tv);
       tv.hidden = false;
     } else if (tv) { tv.hidden = true; tv.srcObject = null; }
-    // --- remote users: separate <audio> (va-*) and <video> (vm-*) elements ---
     Object.keys(c.remote || {}).forEach(uid => {
       const r = c.remote[uid];
       if (!r) return;
-      // Audio element — always bound when audio tracks exist, regardless of camera
       const av = byId("va-" + uid);
       if (av && r.audio) {
         if (av.srcObject !== r.stream) av.srcObject = r.stream;
         playMedia(av);
       }
-      // Video element — only bound when cam is on AND WebRTC has video track
       const el = byId("vm-" + uid);
       const camOn = roster[uid] ? !!roster[uid].cam : true;
       if (el && r.video && camOn) {
@@ -1669,15 +1614,14 @@
         el.hidden = false;
       } else if (el) {
         el.hidden = true;
-        el.srcObject = null;   // safe: audio lives on va-* element
+        el.srcObject = null;
       }
     });
-    // --- screen share ---
     const sv = byId("share-video");
     const shareStream = c.display || (c.remoteShare ? c.remoteShare.stream : null);
     if (sv && shareStream) {
       if (sv.srcObject !== shareStream) sv.srcObject = shareStream;
-      sv.muted = !!c.share;          // mute own screen-share preview (echo)
+      sv.muted = !!c.share;
       playMedia(sv);
       sv.hidden = false;
     } else if (sv) { sv.hidden = true; sv.srcObject = null; }
@@ -1691,7 +1635,7 @@
       c.hasMedia = false; c.cam = false; c.mic = false;
       updateCtl(); updateStage();
       toast("Camera/microphone are not available here. You joined with your avatar.", "info");
-      getPeer();     // still reachable: peers can send us their audio / screen share
+      getPeer();
       return;
     }
     navigator.mediaDevices.getUserMedia({ audio: true, video: false })
@@ -1712,8 +1656,6 @@
         c.hasMedia = false; c.cam = false; c.mic = false;
         updateCtl(); updateStage();
         toast("Could not access camera/microphone (" + (err && err.name ? err.name : "blocked") + "). Joining with your avatar.", "err");
-        // Without a PeerJS id nobody can call us — register anyway so we still
-        // receive the others' audio, camera and screen share.
         getPeer();
       });
   }
@@ -1767,7 +1709,6 @@
     }
   }
 
-  /* ---------- mid-call camera renegotiation (PeerJS has no auto-renegotiate) ---------- */
   function openPeers() {
     const c = S.call; if (!c) return [];
     const out = [];
@@ -1856,7 +1797,6 @@
           if (!r.stream.getAudioTracks().includes(x.track)) r.stream.addTrack(x.track);
         }
       });
-      // Prune ended tracks so stale video ever actually shows.
       r.stream.getTracks().forEach(t => { if (t.readyState === "ended") { try { r.stream.removeTrack(t); } catch (e) {} } });
     } catch (e) {}
     const changed = r.video !== hasVideo || r.audio !== hasAudio;
@@ -1869,6 +1809,11 @@
     }
   }
 
+  /* =========================================================================
+     toggleShare — A4: any successful share start kills music on every client.
+     We broadcast music_stop first so remote clients flip off before the
+     share placeholder paints over their carousel.
+     ========================================================================= */
   async function toggleShare() {
     const c = S.call;
     if (!c) return;
@@ -1883,6 +1828,12 @@
       if (vt) vt.addEventListener("ended", () => stopShare(true));
       const at = s.getAudioTracks()[0];
       if (at) at.addEventListener("ended", () => stopShare(true));
+      // A4: music mode dies everywhere when a share starts.
+      if (SP.on) {
+        const ch = getChannel(c.guildId);
+        if (ch) { try { ch.send({ type: "broadcast", event: "music_stop", payload: { from: S.user.id, reason: "share" } }); } catch (e) {} }
+        stopSpotify();
+      }
       const dialed = startShareRemote(s);
       pushPresence();
       updateStage(); updateCtl();
@@ -1906,13 +1857,9 @@
     toast(auto ? "Screen share ended." : "You stopped sharing.", "info");
   }
 
-  /* ---------- talking activity rings (analysed locally, synced to peers) ----------
-     An analyser can only ever hear the local microphone, so whoever is talking
-     publishes that fact on the server channel ("talk") and every client draws
-     the same green ring around the same speaker. */
   const _watch = {};
   const talkCtxs = new Set();
-  const talkState = {};                                  // uid -> { talking, int, at }
+  const talkState = {};
   const talkSent = { state: false, at: 0, level: 0 };
   const tileEl = uid => document.querySelector('.tile[data-user-id="' + uid + '"]') || byId(uid === S.user.id ? "tile-self" : "tile-" + uid);
   function resumeTalkContexts() {
@@ -1921,8 +1868,8 @@
   function setTalkVisual(uid, talking, int) {
     const el = tileEl(uid);
     if (!el) return;
-    el.classList.toggle("talking", !!talking);    // green glowing ring on the avatar
-    el.classList.toggle("speaking", !!talking);   // tile border glow (camera-on tiles have no avatar)
+    el.classList.toggle("talking", !!talking);
+    el.classList.toggle("speaking", !!talking);
     const av = $(".tile-avatar", el);
     if (av) av.style.setProperty("--talk-int", String(Math.max(0, Math.min(1, int || 0))));
   }
@@ -1936,15 +1883,13 @@
     if (uid) { delete talkState[uid]; setTalkVisual(uid, false, 0); return; }
     Object.keys(talkState).forEach(k => { delete talkState[k]; setTalkVisual(k, false, 0); });
   }
-  /* Publish our own speaking state (throttled: ~8 updates/second while talking,
-     one final update when we stop). */
   function broadcastTalk(level) {
     const c = S.call;
     if (!c || !S.user || !supabaseClient) return;
     const talking = level > 0.3;
     const now = Date.now();
     if (talking === talkSent.state) {
-      if (!talking) return;                                  // already reported "stopped"
+      if (!talking) return;
       if (now - talkSent.at < 120) return;
       if (Math.abs(level - talkSent.level) < 0.04 && now - talkSent.at < 500) return;
     }
@@ -1981,9 +1926,6 @@
     } catch (e) { return; }
     const resume = () => { if (ctx && ctx.state === "suspended") { try { ctx.resume(); } catch (e) {} } };
     talkCtxs.add(ctx);
-    // A fresh AudioContext starts suspended until the page has user activation,
-    // which would leave the analyser reading silence — resume it eagerly and on
-    // every later gesture (see the boot-time listeners).
     resume();
     resumeTalkContexts();
     const buf = new Float32Array(analyser.fftSize);
@@ -2002,8 +1944,6 @@
       if (typeof onLevel === "function") {
         onLevel(watcher.int);
       } else {
-        // The speaker's own "talk" broadcast is authoritative; this local
-        // analyser is only a fallback for peers that stopped reporting.
         const t = talkState[uid];
         if (!t || Date.now() - t.at > 1500) setTalkVisual(uid, watcher.talking, watcher.int);
       }
@@ -2043,12 +1983,9 @@
     } catch (e) { return null; }
   }
   function sbStopAllLocal() { _sbAudio.forEach(a => { try { a.pause(); a.src = ""; } catch (e) {} }); _sbAudio.length = 0; }
-  const soundWait = {};          // player id -> timer waiting for their WebRTC clip
+  const soundWait = {};
   function sbBroadcast(s) {
     if (!S.call || !s || !supabaseClient) return;
-    // Stream the clip into the WebRTC audio graph for everyone in the call and
-    // announce it on the channel; listeners only fall back to playing the data
-    // URL themselves when that media connection never shows up.
     const rtc = playSoundboardToCall(s.dataUrl);
     const ch = getChannel(S.call.guildId);
     if (ch) {
@@ -2062,8 +1999,6 @@
     if (!S.call || !p) return;
     if (p.player && p.player === S.user.id) return;
     if (p.rtc && p.dataUrl) {
-      // The player is pushing the clip over WebRTC — wait for that stream so the
-      // clip is not heard twice, and fall back to the data URL if it never lands.
       if (soundWait[p.player]) clearTimeout(soundWait[p.player]);
       soundWait[p.player] = setTimeout(() => {
         delete soundWait[p.player];
@@ -2097,8 +2032,6 @@
         if (i !== -1) c.soundLocal.splice(i, 1);
         try { audio.pause(); audio.src = ""; } catch (e) {}
         try { ctx.close(); } catch (e) {}
-        // The clip is over: close the per-peer connections instead of leaking
-        // one media connection per sound until we leave the call.
         c.soundMc = (c.soundMc || []).filter(mc => calls.indexOf(mc) === -1);
         calls.splice(0).forEach(mc => { try { mc.close(); } catch (e) {} });
       };
@@ -2115,8 +2048,6 @@
         } catch (e) {}
       });
       c.soundMc.push(...calls);
-      // A suspended context is silent for us *and* for the peers (they receive
-      // this context's output stream), so nudge it awake.
       if (ctx.state === "suspended") { try { const pr = ctx.resume(); if (pr && pr.catch) pr.catch(() => {}); } catch (e) {} }
       audio.play().catch(() => {});
       return calls.length > 0;
@@ -2425,7 +2356,6 @@
         if (name.length < 2) return toast("Display name needs 2+ characters.", "err");
         S.user = { id: S.user.id, name, color: chosen };
         DB.profiles[S.user.id] = { id: S.user.id, name, color: chosen };
-        // Names/colors live in auth user_metadata (given schema has no name columns).
         if (supabaseClient) {
           supabaseClient.auth.updateUser({ data: { display_name: name, color: chosen } }).then(() => {}).catch(() => {});
           pushPresence();
@@ -2472,15 +2402,11 @@
         const id = b.dataset.id;
         const ch = supabaseClient ? getChannel(g.id) : null;
         if (b.dataset.act === "inv") {
-          if (ch) {
-            try { ch.send({ type: "broadcast", event: "invite", payload: { guildId: g.id, from: S.user.id } }); } catch (e) {}
-          }
+          if (ch) { try { ch.send({ type: "broadcast", event: "invite", payload: { guildId: g.id, from: S.user.id } }); } catch (e) {} }
           const tgt = users()[id];
           toast((tgt ? tgt.name : "They") + " were invited to the call.", "ok");
         } else {
-          if (ch) {
-            try { ch.send({ type: "broadcast", event: "kick", payload: { guildId: g.id, userId: id, by: S.user.id } }); } catch (e) {}
-          }
+          if (ch) { try { ch.send({ type: "broadcast", event: "kick", payload: { guildId: g.id, userId: id, by: S.user.id } }); } catch (e) {} }
           const tgt = users()[id];
           toast((tgt ? tgt.name : "They") + " were disconnected.", "info");
         }
@@ -2527,13 +2453,8 @@
     "https://api.piped.private.coffee"
   ];
 
-  /* -------- Resolver health cache --------
-     When Invidious/Piped go down (which they are most of the time on some
-     networks), we remember it in localStorage so the very next track skips
-     the whole resolver chain and goes straight to the YouTube IFrame player.
-     The cache expires after COOLDOWN_MS so we periodically re-probe. */
   const RESOLVER_CACHE_KEY = "hc_resolver_down_until";
-  const RESOLVER_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+  const RESOLVER_COOLDOWN_MS = 30 * 60 * 1000;
 
   function isResolverKnownDown() {
     try {
@@ -2627,7 +2548,6 @@
     return out.slice(0, 6);
   }
 
-  /* ---------- YouTube IFrame player ---------- */
   let ytPlayer = null;
   let ytPlayerReady = false;
   let ytApiPromise = null;
@@ -2683,7 +2603,6 @@
               done(true);
             },
             onStateChange: (e) => {
-              // 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
               if (e.data === 0 && SP.on) nextTrack({ auto: true });
               if (e.data === 1) { SP.playing = true; updateDock(); }
               if (e.data === 2) { SP.playing = false; updateDock(); }
@@ -2712,7 +2631,6 @@
     if (host) host.innerHTML = "";
   }
 
-  /* ---------- HTML5 <audio> engine ---------- */
   let audioEl = null;
   let audioReady = false;
   let audioTrackId = null;
@@ -2806,7 +2724,6 @@
   function pauseAudio() { if (audioEl) { try { audioEl.pause(); } catch (e) {} } }
   function seekAudio(sec) { if (audioEl && sec != null) { try { audioEl.currentTime = sec; } catch (e) {} } }
 
-  /* ---------- SoundCloud ---------- */
   let scWidget = null;
   let scWidgetReady = false;
   let scBaseUrl = "";
@@ -2877,7 +2794,6 @@
     scBaseUrl = "";
   }
 
-  /* ---------- core playback controller ---------- */
   function curTrack() { return SP.queue[SP.index] || null; }
   function ensureHost() {
     if (!S.user) return;
@@ -2895,7 +2811,6 @@
     return "";
   }
 
-  /* ---------- session sync ---------- */
   function syncSpotify() { if (S.call) pushMusic(); }
   function applySpotifySync(p) {
     if (!p || typeof p !== "object" || !SP.on || !S.call) return;
@@ -2918,26 +2833,22 @@
     if (S.call) { updateCarousel(); updateDynamicBackground(t); updateDock(); }
   }
 
-  /* ---------- THE MAIN PLAYBACK FUNCTION with fast-path ---------- */
   async function loadYouTubeTrack(ytId, autoPlay = true) {
     if (!ytId || !SP.on) return;
     if (autoPlay) SP.playing = true;
     const t = curTrack();
 
-    // Already playing via <audio> — resume immediately
     if (t && t.ytId === ytId && t.source === "audio" && t.url) {
       playAudioTrack(t, autoPlay);
       return;
     }
 
-    // Already on IFrame for this track — just play/pause
     if (t && t.ytId === ytId && t.source === "ytiframe" && ytPlayer && ytPlayerReady) {
       if (autoPlay) { try { ytPlayer.playVideo(); } catch(e){} }
       else { try { ytPlayer.pauseVideo(); } catch(e){} }
       return;
     }
 
-    // ---- FAST PATH: resolvers were down recently → go straight to IFrame ----
     if (isResolverKnownDown()) {
       logPlayer("info", "Resolvers marked down — using YouTube IFrame directly for " + ytId);
       if (t && t.ytId === ytId) { t.source = "ytiframe"; t.url = null; t.audUrls = null; }
@@ -2950,7 +2861,6 @@
       return;
     }
 
-    // ---- SLOW PATH: try resolvers with a tight timeout ----
     logPlayer("info", "Resolving audio stream for " + ytId + "…");
     toast("Resolving audio stream…", "info");
 
@@ -2969,7 +2879,6 @@
       return;
     }
 
-    // ---- FAILURE: mark resolvers down for 30 min, use IFrame ----
     markResolverDown();
     logPlayer("warn", "Resolvers unreachable — cached for 30 min. Using YouTube IFrame for " + ytId);
     toast("Resolvers down — using YouTube player.", "info");
@@ -2985,7 +2894,6 @@
     }
   }
 
-  /* ---------- playback controls ---------- */
   function setTrack(ni, opts) {
     opts = opts || {};
     if (!SP.queue.length || !SP.on) return;
@@ -3109,7 +3017,6 @@
     refreshProgress();
   }
 
-  /* ---------- dynamic background ---------- */
   function updateDynamicBackground(t, immediate) {
     const bgA = byId("sp-bg-a"), bgB = byId("sp-bg-b");
     if (!bgA || !bgB) return;
@@ -3129,7 +3036,6 @@
     }, 800);
   }
 
-  /* ---------- music UI ---------- */
   function renderMusic() {
     const main = byId("stage-main");
     if (!main) return;
@@ -3666,11 +3572,74 @@
   }
   function togglePanel(which) { SP.openPanel = SP.openPanel === which ? null : which; refreshPanels(); updateDock(); }
 
-  /* ---------- session lifecycle ---------- */
+  /* =========================================================================
+     onMusicInvite — A2: everyone else gets a Join toast when music starts or
+     when they join a call where music is already running.
+     ========================================================================= */
+  function onMusicInvite(p) {
+    if (!p || !S.call) return;
+    if (SP.on) return;   // already in sync
+    const hostId = p.hostId;
+    if (hostId && hostId === S.user.id) return;   // our own broadcast
+    const hostName = hostId ? (displayName(hostId, null) || "Someone") : "Someone";
+    const queueCount = (p.queue && p.queue.length) || 0;
+    const msg = hostName + " started a listening session" + (queueCount ? " (" + queueCount + " tracks)" : "") + ". Join?";
+    const el = document.createElement("div");
+    el.className = "toast info";
+    el.style.pointerEvents = "auto";
+    el.style.flexDirection = "column";
+    el.style.alignItems = "stretch";
+    el.style.gap = "10px";
+    el.style.padding = "12px 14px";
+    el.innerHTML =
+      '<div style="display:flex;align-items:center;gap:9px;">' +
+        '<span class="t-icon">' + ic("headphone", 15) + '</span>' +
+        '<span style="font-weight:600;">' + esc(msg) + "</span>" +
+      "</div>" +
+      '<div style="display:flex;gap:8px;justify-content:flex-end;">' +
+        '<button class="btn btn-ghost btn-sm" data-join-no>Not now</button>' +
+        '<button class="btn btn-green btn-sm" data-join-yes>' + ic("check", 13) + " Join</button>" +
+      "</div>";
+    const root = byId("toasts");
+    root.appendChild(el);
+    requestAnimationFrame(() => el.classList.add("show"));
+    let closed = false;
+    const close = () => { if (closed) return; closed = true; el.classList.remove("show"); setTimeout(() => el.remove(), 300); };
+    el.querySelector("[data-join-no]").addEventListener("click", close);
+    el.querySelector("[data-join-yes]").addEventListener("click", () => {
+      close();
+      // Adopt the host's session and turn on music mode locally.
+      if (p.queue && p.queue.length) {
+        SP.queue = p.queue.slice();
+        p.queue.forEach(t => { TRACK_INDEX[t.id] = t; });
+      }
+      SP.index = Math.max(0, Math.min(p.index || 0, Math.max(0, SP.queue.length - 1)));
+      SP.volume = Math.max(0, Math.min(1, typeof p.volume === "number" ? p.volume : SP.volume));
+      SP.playing = !!p.playing;
+      SP.hostId = hostId || SP.hostId;
+      SP.on = true;
+      if (!SP.tickI) SP.tickI = setInterval(tickSpotify, 250);
+      const t = curTrack();
+      if (t) {
+        if (t.source === "audio" && t.url) playAudioTrack(t, SP.playing);
+        else if (t.source === "sc" && t.scUrl) loadSoundCloudTrack(t, SP.playing);
+        else if (t.source === "ytiframe" && t.ytId) playViaYouTubeIframe(t.ytId, SP.playing);
+        else if (t.ytId) loadYouTubeTrack(t.ytId, true);
+      }
+      updateStage();
+      updateCtl();
+      toast("Joined the listening session.", "ok");
+    });
+    setTimeout(close, 15000);
+  }
+
+  /* =========================================================================
+     startSpotify — A2: broadcasts a music_invite so everyone else gets the
+     Join toast. Everything else is unchanged.
+     ========================================================================= */
   function startSpotify() {
     if (!S.call) return toast("Join a call first to start collaborative music.", "err");
     if (SP.on) return;
-    // If we have a fresh music snapshot from call presence, adopt its queue.
     if (S.callMusic && Array.isArray(S.callMusic.queue) && S.callMusic.queue.length) {
       SP.queue = S.callMusic.queue;
       SP.index = Math.max(0, Math.min(S.callMusic.index || 0, SP.queue.length - 1));
@@ -3688,6 +3657,14 @@
     syncSpotify();
     updateStage();
     updateCtl();
+    const ch = getChannel(S.call.guildId);
+    if (ch) {
+      try {
+        ch.send({ type: "broadcast", event: "music_invite", payload: {
+          hostId: S.user.id, queue: SP.queue, index: SP.index, playing: SP.playing, pos: SP.pos, volume: SP.volume
+        } });
+      } catch (e) {}
+    }
     toast(t ? "Music is active." : "Music mode on — search a track to start.", "ok");
   }
 
@@ -3721,7 +3698,6 @@
       clearLogs: () => { playerLogs.length = 0; },
       joinCall, leaveCall, startSpotify, stopSpotify, togglePlay, nextTrack, prevTrack,
       resolveInvidiousCandidates, loadYouTubeTrack, playViaYouTubeIframe,
-      /* voice-call internals — used by the headless smoke test */
       openRealtime, applyActiveUsers, updateStage, tileFor, attachMedia,
       getPeer, onIncomingCall, upsertRemote, cleanupRemote, startShareRemote, ensureShareMesh,
       onTalkBroadcast, broadcastTalk, setTalkVisual, onSbPlay, sbBroadcast, sbPlay,
