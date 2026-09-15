@@ -155,13 +155,18 @@
       if (S.call.sharePending) {
         Object.keys(roster).forEach(id => {
           if (id === S.user.id) return;
-          if (roster[id].share && !(prevRoster[id] || {}).share) S.call.sharePending[id] = true;
-          if (!roster[id].share) delete S.call.sharePending[id];
+          if (roster[id].share && !(prevRoster[id] || {}).share) {
+            S.call.sharePending[id] = true;
+            if (!S.call.sharePendingAge) S.call.sharePendingAge = {};
+            S.call.sharePendingAge[id] = Date.now();
+          }
+          if (!roster[id].share) {
+            delete S.call.sharePending[id];
+            if (S.call.sharePendingAge) delete S.call.sharePendingAge[id];
+          }
         });
       }
     }
-    // A2: newly-joining user notification — someone in the call already has
-    // music running and we just joined, so offer to join the session.
     if (origin === "rt" && S.call && S.call.guildId === g.id && music && music.queue && music.playing && !SP.on && S.call.joinAt && Date.now() - S.call.joinAt < 6000) {
       onMusicInvite({ hostId: music.hostId, queue: music.queue, index: music.index, pos: music.pos, volume: music.volume });
     }
@@ -274,10 +279,16 @@
     r.share = !!p.share;
     if (p.name || p.color) ensureProfile(p.from, p.name, p.color);
     if (S.call.sharePending) {
-      if (r.share && !prevShare) S.call.sharePending[p.from] = true;
-      if (!r.share) delete S.call.sharePending[p.from];
+      if (r.share && !prevShare) {
+        S.call.sharePending[p.from] = true;
+        if (!S.call.sharePendingAge) S.call.sharePendingAge = {};
+        S.call.sharePendingAge[p.from] = Date.now();
+      }
+      if (!r.share) {
+        delete S.call.sharePending[p.from];
+        if (S.call.sharePendingAge) delete S.call.sharePendingAge[p.from];
+      }
     }
-    // A4: share priority — if a peer starts sharing, kill music on our side too.
     if (r.share && !prevShare && SP.on) stopSpotify();
     if (byId("call-view")) {
       if (r.share !== prevShare) updateStage();
@@ -319,9 +330,7 @@
     ch.on("broadcast", { event: "state" }, p => onStateBroadcast(p));
     ch.on("broadcast", { event: "talk" }, p => onTalkBroadcast(p));
     ch.on("broadcast", { event: "typing" }, p => onTyping(p));
-    // A2: someone started a music session — offer to join.
     ch.on("broadcast", { event: "music_invite" }, p => onMusicInvite(broadcastPayload(p)));
-    // A4: someone started screen sharing — music stops everywhere.
     ch.on("broadcast", { event: "music_stop" }, p => {
       p = broadcastPayload(p);
       if (!S.call || S.call.guildId !== gid) return;
@@ -1134,7 +1143,8 @@
     S.call = {
       guildId: g.id, joinAt: now, mic: false, cam: false, share: false,
       stream: null, display: null, hasMedia: false, shareWaiting: false,
-      peers: {}, shareMc: {}, soundMc: [], soundLocal: [], soundRemote: [], remote: {}, remoteShare: null, sharePending: {}
+      peers: {}, shareMc: {}, soundMc: [], soundLocal: [], soundRemote: [], remote: {}, remoteShare: null,
+      sharePending: {}, sharePendingAge: {}
     };
     g.roster = g.roster || {};
     g.roster[S.user.id] = { name: S.user.name, color: S.user.color, mic: false, cam: false, share: false, joinedAt: now };
@@ -1147,7 +1157,6 @@
     startPresenceBeat();
     playChime();
     toast("Joined " + g.name + " · Voice Lounge", "ok");
-    // A2: if music was already running when we joined, offer it now.
     if (S.callMusic && S.callMusic.queue && S.callMusic.queue.length && S.callMusic.playing && !SP.on) {
       setTimeout(() => onMusicInvite(S.callMusic), 800);
     }
@@ -1258,6 +1267,7 @@
       if (c.remoteShare && c.remoteShare.stream) { try { c.remoteShare.stream.getTracks().forEach(t => t.stop()); } catch (e) {} }
       c.remoteShare = null;
       c.sharePending = {};
+      c.sharePendingAge = {};
       (c.soundRemote || []).forEach(a => {
         try { a.pause(); } catch (e) {}
         try { a.srcObject = null; } catch (e) {}
@@ -1333,10 +1343,21 @@
       const drop = () => {
         if (!c || !c.remoteShare || c.remoteShare.id !== uid) return;
         c.remoteShare = null;
-        if (c.sharePending && roster[uid] && roster[uid].share) c.sharePending[uid] = true;
+        if (c.sharePending && roster[uid] && roster[uid].share) {
+          c.sharePending[uid] = true;
+          if (!c.sharePendingAge) c.sharePendingAge = {};
+          c.sharePendingAge[uid] = Date.now();
+        }
         updateStage();
       };
-      mc.on("stream", s => { c.remoteShare = { id: uid, stream: s }; if (c.sharePending) delete c.sharePending[uid]; updateStage(); });
+      mc.on("stream", s => {
+        c.remoteShare = { id: uid, stream: s };
+        if (c.sharePending) {
+          delete c.sharePending[uid];
+          if (c.sharePendingAge) delete c.sharePendingAge[uid];
+        }
+        updateStage();
+      });
       mc.on("close", drop);
       mc.on("error", drop);
       return;
@@ -1481,26 +1502,51 @@
     if (sbBtn) sbBtn.classList.toggle("on-accent", !!SB.open);
   }
 
-  /* =========================================================================
-     updateStage — THE FIX LIVES HERE.
-     The share branch now requires an ACTUAL stream (c.display or
-     c.remoteShare.stream) instead of any truthy share flag, and the SP.on
-     branch finally calls renderMusic() instead of painting the share
-     placeholder. This is why the carousel was never showing.
-     ========================================================================= */
+  function streamIsLive(stream) {
+    if (!stream) return false;
+    try {
+      const vts = stream.getVideoTracks ? stream.getVideoTracks() : [];
+      return vts.some(t => t && t.readyState !== "ended" && t.enabled !== false);
+    } catch (e) { return false; }
+  }
   function updateStage() {
     const c = S.call;
     if (!c) return;
     const g = guilds()[c.guildId];
     if (!g) return;
+
+    if (c.display && !streamIsLive(c.display)) {
+      try { c.display.getTracks().forEach(t => t.stop()); } catch (e) {}
+      c.display = null;
+      c.share = false;
+      c.shareWaiting = false;
+    }
+    if (c.remoteShare && !streamIsLive(c.remoteShare.stream)) {
+      c.remoteShare = null;
+    }
+    if (c.sharePending) {
+      const now = Date.now();
+      Object.keys(c.sharePending).forEach(k => {
+        const age = c.sharePendingAge && c.sharePendingAge[k] ? now - c.sharePendingAge[k] : 99999;
+        if (age > 12000) {
+          delete c.sharePending[k];
+          if (c.sharePendingAge) delete c.sharePendingAge[k];
+        }
+      });
+    }
+
     const countEl = byId("call-count");
     if (countEl) countEl.textContent = g.call.length;
     const main = byId("stage-main");
     const strip = byId("stage-strip");
     if (!main) return;
     const tiles = g.call.map(id => tileFor(id)).join("");
-    const activeShareStream = c.display || (c.remoteShare && c.remoteShare.stream) || null;
-    if (activeShareStream) {
+
+    const ownLive = streamIsLive(c.display);
+    const remoteLive = c.remoteShare && streamIsLive(c.remoteShare.stream);
+    const hasPendingShare = !ownLive && !remoteLive && c.sharePending && Object.keys(c.sharePending).length > 0;
+
+    if (ownLive || remoteLive) {
       main.classList.remove("music");
       main.classList.add("share");
       main.innerHTML = shareTile();
@@ -1515,13 +1561,20 @@
     } else {
       main.classList.remove("music");
       main.classList.remove("share");
-      const html = tiles || '<div class="ok-msg">The call is empty.</div>';
-      main.innerHTML = '<div class="tiles" id="tiles">' + html + "</div>";
-      strip.hidden = true;
-      strip.innerHTML = "";
-      const t = byId("tiles");
-      const cols = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(g.call.length))));
-      t.style.gridTemplateColumns = "repeat(" + cols + ", minmax(0, 1fr))";
+      if (hasPendingShare) {
+        main.classList.add("share");
+        main.innerHTML = shareTile();
+        strip.hidden = false;
+        strip.innerHTML = tiles;
+      } else {
+        const html = tiles || '<div class="ok-msg">The call is empty.</div>';
+        main.innerHTML = '<div class="tiles" id="tiles">' + html + "</div>";
+        strip.hidden = true;
+        strip.innerHTML = "";
+        const t = byId("tiles");
+        const cols = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(g.call.length))));
+        t.style.gridTemplateColumns = "repeat(" + cols + ", minmax(0, 1fr))";
+      }
     }
     refreshTalkVisuals();
     attachMedia();
@@ -1809,11 +1862,6 @@
     }
   }
 
-  /* =========================================================================
-     toggleShare — A4: any successful share start kills music on every client.
-     We broadcast music_stop first so remote clients flip off before the
-     share placeholder paints over their carousel.
-     ========================================================================= */
   async function toggleShare() {
     const c = S.call;
     if (!c) return;
@@ -1828,7 +1876,6 @@
       if (vt) vt.addEventListener("ended", () => stopShare(true));
       const at = s.getAudioTracks()[0];
       if (at) at.addEventListener("ended", () => stopShare(true));
-      // A4: music mode dies everywhere when a share starts.
       if (SP.on) {
         const ch = getChannel(c.guildId);
         if (ch) { try { ch.send({ type: "broadcast", event: "music_stop", payload: { from: S.user.id, reason: "share" } }); } catch (e) {} }
@@ -3572,15 +3619,11 @@
   }
   function togglePanel(which) { SP.openPanel = SP.openPanel === which ? null : which; refreshPanels(); updateDock(); }
 
-  /* =========================================================================
-     onMusicInvite — A2: everyone else gets a Join toast when music starts or
-     when they join a call where music is already running.
-     ========================================================================= */
   function onMusicInvite(p) {
     if (!p || !S.call) return;
-    if (SP.on) return;   // already in sync
+    if (SP.on) return;
     const hostId = p.hostId;
-    if (hostId && hostId === S.user.id) return;   // our own broadcast
+    if (hostId && hostId === S.user.id) return;
     const hostName = hostId ? (displayName(hostId, null) || "Someone") : "Someone";
     const queueCount = (p.queue && p.queue.length) || 0;
     const msg = hostName + " started a listening session" + (queueCount ? " (" + queueCount + " tracks)" : "") + ". Join?";
@@ -3608,7 +3651,6 @@
     el.querySelector("[data-join-no]").addEventListener("click", close);
     el.querySelector("[data-join-yes]").addEventListener("click", () => {
       close();
-      // Adopt the host's session and turn on music mode locally.
       if (p.queue && p.queue.length) {
         SP.queue = p.queue.slice();
         p.queue.forEach(t => { TRACK_INDEX[t.id] = t; });
@@ -3633,10 +3675,6 @@
     setTimeout(close, 15000);
   }
 
-  /* =========================================================================
-     startSpotify — A2: broadcasts a music_invite so everyone else gets the
-     Join toast. Everything else is unchanged.
-     ========================================================================= */
   function startSpotify() {
     if (!S.call) return toast("Join a call first to start collaborative music.", "err");
     if (SP.on) return;
