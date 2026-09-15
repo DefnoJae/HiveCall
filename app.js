@@ -139,6 +139,17 @@
     g.call = Object.keys(roster);
     g.roster = roster;
     if (music && music.queue) S.callMusic = music;
+    if (origin === "rt" && S.call && S.call.guildId === g.id) {
+      g.call.filter(id => !prevCall.includes(id) && id !== S.user.id).forEach(id => {
+        toast(displayName(id, roster[id] && roster[id].name) + " joined the call.", "info");
+      });
+      prevCall.filter(id => !g.call.includes(id) && id !== S.user.id).forEach(id => {
+        toast(displayName(id, prevRoster[id] && prevRoster[id].name) + " left the call.", "info");
+      });
+      g.call.filter(id => !!((roster[id] || {}).share) && !(prevRoster[id] || {}).share).forEach(id => {
+        toast(displayName(id, roster[id] && roster[id].name) + " started sharing their screen.", "info");
+      });
+    }
     if (origin !== "local" && S.call && S.call.guildId === g.id) {
       if (music && music.queue && SP.on) applySpotifySync(music);
       // Dial users we aren't connected to yet (lower-id initiates to avoid double-dials).
@@ -153,6 +164,10 @@
         else { g.call.forEach(id => updateTileFor(id)); updateCtl(); }
       }
     }
+  }
+
+  function broadcastPayload(message) {
+    return message && message.payload && typeof message.payload === "object" ? message.payload : (message || {});
   }
 
   async function loadSoundboard(g) {
@@ -234,6 +249,7 @@
     attachMedia();
   }
   function onStateBroadcast(p) {
+    p = broadcastPayload(p);
     if (!S.call || !p || !p.from || p.from === S.user.id) return;
     const g = guilds()[S.call.guildId];
     if (!g) return;
@@ -284,8 +300,9 @@
     ch.on("broadcast", { event: "wreg" }, p => onRenegotiation(p));
     ch.on("broadcast", { event: "state" }, p => onStateBroadcast(p));
     ch.on("broadcast", { event: "typing" }, p => onTyping(p));
-    ch.on("broadcast", { event: "kick" }, p => { if (S.call && S.call.guildId === gid && p.userId && p.userId === S.user.id) { toast("You were disconnected by a server member.", "err"); leaveCall(); } });
+    ch.on("broadcast", { event: "kick" }, message => { const p = broadcastPayload(message); if (S.call && S.call.guildId === gid && p.userId && p.userId === S.user.id) { toast("You were disconnected by a server member.", "err"); leaveCall(); } });
     ch.on("broadcast", { event: "invite" }, p => {
+      p = broadcastPayload(p);
       if (!p || !p.from || p.from === S.user.id) return;
       if (!S.call || S.call.guildId !== gid) {
         const me = users()[p.from];
@@ -1010,6 +1027,7 @@
     else { el.style.display = "none"; el.innerHTML = ""; }
   }
   function onTyping(p) {
+    p = broadcastPayload(p);
     const me = (S.user && S.user.id) || "";
     if (!p || !p.from || p.from === me) return;
     if (p.stopped) {
@@ -1091,7 +1109,7 @@
     S.call = {
       guildId: g.id, joinAt: now, mic: false, cam: false, share: false,
       stream: null, display: null, hasMedia: false,
-      peers: {}, shareMc: {}, remote: {}, remoteShare: null
+      peers: {}, shareMc: {}, soundMc: [], soundLocal: [], soundRemote: [], remote: {}, remoteShare: null
     };
     // Reflect self in the roster immediately (locally + Supabase).
     g.roster = g.roster || {};
@@ -1112,6 +1130,9 @@
     const gid = c.guildId;
     Object.keys(c.peers || {}).forEach(k => { try { c.peers[k].close(); } catch (e) {} });
     Object.keys(c.shareMc || {}).forEach(k => { try { c.shareMc[k].close(); } catch (e) {} });
+    (c.soundMc || []).forEach(mc => { try { mc.close(); } catch (e) {} });
+    (c.soundLocal || []).forEach(item => { try { item.audio.pause(); item.audio.src = ""; } catch (e) {} try { item.ctx.close(); } catch (e) {} });
+    (c.soundRemote || []).forEach(audio => { try { audio.pause(); audio.srcObject = null; } catch (e) {} });
     Object.keys(c.remote || {}).forEach(k => unwatchTalkLevel(k));
     if (peer && !peer.destroyed) { try { peer.destroy(); } catch (e) {} }
     peer = null; peerOpen = false; peerError = false;
@@ -1204,6 +1225,19 @@
       mc.on("stream", s => { c.remoteShare = { id: uid, stream: s }; updateStage(); });
       mc.on("close", () => { if (c && c.remoteShare && c.remoteShare.id === uid) { c.remoteShare = null; updateStage(); } });
       mc.on("error", () => { if (c && c.remoteShare && c.remoteShare.id === uid) { c.remoteShare = null; updateStage(); } });
+      return;
+    }
+    if (mc.metadata && mc.metadata.kind === "sound") {
+      try { mc.answer(); } catch (e) {}
+      const audio = document.createElement("audio");
+      audio.autoplay = true;
+      audio.playsInline = true;
+      audio.srcObject = null;
+      c.soundRemote.push(audio);
+      mc.on("stream", s => { audio.srcObject = s; playMedia(audio); });
+      const remove = () => { const i = c.soundRemote.indexOf(audio); if (i !== -1) c.soundRemote.splice(i, 1); try { audio.pause(); audio.srcObject = null; } catch (e) {} };
+      mc.on("close", remove);
+      mc.on("error", remove);
       return;
     }
     try { mc.answer(c.stream || undefined); } catch (e) {}
@@ -1585,6 +1619,7 @@
       .catch(e => console.warn("cam renegotiation offer failed", uid, e));
   }
   function onRenegotiation(p) {
+    p = broadcastPayload(p);
     const c = S.call;
     if (!p || !p.sdp || !p.sdp.type || !c) return;
     if (p.from && p.from === S.user.id) return;
@@ -1765,7 +1800,7 @@
   function sbStopAllLocal() { _sbAudio.forEach(a => { try { a.pause(); a.src = ""; } catch (e) {} }); _sbAudio.length = 0; }
   function sbBroadcast(s) {
     if (!S.call || !s || !supabaseClient) return;
-    sbPlay(s.dataUrl);
+    playSoundboardToCall(s.dataUrl);
     const ch = getChannel(S.call.guildId);
     if (ch) {
       try { ch.send({ type: "broadcast", event: "sb_play", payload: { id: s.id, name: s.name, emoji: s.emoji, dataUrl: s.dataUrl, player: S.user.id } }); } catch (e) {}
@@ -1774,11 +1809,53 @@
     toast((s.emoji || "🔊") + " " + s.name + " — played by " + (me ? me.name : "someone"), "info");
   }
   function onSbPlay(p) {
+    p = broadcastPayload(p);
     if (!S.call || !p) return;
     if (p.player && p.player === S.user.id) return;
     sbPlay(p.dataUrl);
     const nm = displayName(p.player, null);
     toast((p.emoji || "🔊") + " " + (p.name || "sound") + " — played by " + (nm || "someone"), "info");
+  }
+
+  function playSoundboardToCall(audioUrl) {
+    const c = S.call;
+    if (!c || !audioUrl || !peerOpen || !peer) return sbPlay(audioUrl);
+    try {
+      const audio = new Audio(audioUrl);
+      audio.crossOrigin = "anonymous";
+      audio.volume = SB.vol;
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const source = ctx.createMediaElementSource(audio);
+      const speakers = ctx.createGain();
+      const destination = ctx.createMediaStreamDestination();
+      source.connect(speakers);
+      speakers.connect(ctx.destination);
+      source.connect(destination);
+      const item = { audio, ctx };
+      c.soundLocal.push(item);
+      const finish = () => {
+        const i = c.soundLocal.indexOf(item);
+        if (i !== -1) c.soundLocal.splice(i, 1);
+        try { audio.pause(); audio.src = ""; } catch (e) {}
+        try { ctx.close(); } catch (e) {}
+      };
+      audio.addEventListener("ended", finish, { once: true });
+      const calls = [];
+      const roster = (guilds()[c.guildId] || {}).call || [];
+      roster.forEach(uid => {
+        if (uid === S.user.id) return;
+        try {
+          const mc = peer.call(uid, destination.stream, { metadata: { kind: "sound" } });
+          calls.push(mc);
+          mc.on("close", () => { const i = calls.indexOf(mc); if (i !== -1) calls.splice(i, 1); });
+          mc.on("error", () => { try { mc.close(); } catch (e) {} });
+        } catch (e) {}
+      });
+      c.soundMc.push(...calls);
+      audio.play().catch(() => {});
+    } catch (e) {
+      sbPlay(audioUrl);
+    }
   }
   function onSoundboardRealtime(payload) {
     if (!S.call) return;
