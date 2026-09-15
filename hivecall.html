@@ -641,6 +641,8 @@ input, textarea, select { font-family: inherit; }
   function applyActiveUsers(g, obj, origin) {
     obj = obj && typeof obj === "object" ? obj : {};
     ROSTER_MIRROR[g.id] = obj;
+    const prevCall = g.call || [];
+    const prevRoster = g.roster || {};
     const roster = {};
     let music = null;
     Object.keys(obj).forEach(k => {
@@ -655,6 +657,17 @@ input, textarea, select { font-family: inherit; }
     if (music && music.queue) S.callMusic = music;
     if (origin !== "local" && S.call && S.call.guildId === g.id) {
       if (music && music.queue && SP.on) applySpotifySync(music);
+      // Dial users we aren't connected to yet (lower-id initiates to avoid double-dials).
+      if (peerOpen && S.call && S.call.guildId === g.id) {
+        g.call.forEach(id => { if (id !== S.user.id && S.user.id < id) callUser(id); });
+      }
+      if (byId("call-view")) {
+        const added = g.call.some(id => !prevCall.includes(id));
+        const removed = prevCall.some(id => !g.call.includes(id));
+        const shareFlip = g.call.some(id => !!((prevRoster[id] || {}).share) !== !!((roster[id] || {}).share));
+        if (added || removed || shareFlip) { updateStage(); updateCtl(); }
+        else { g.call.forEach(id => updateTileFor(id)); updateCtl(); }
+      }
     }
   }
 
@@ -686,8 +699,76 @@ input, textarea, select { font-family: inherit; }
     });
   }
 
+  /* Instant (broadcast) mic/cam/share state propagation — mirrors pushPresence
+     without waiting for the DB roundtrip. DB presence still records the state
+     for anyone who joins later. */
+  function sendState() {
+    const c = S.call;
+    if (!c || !S.user || !supabaseClient) return;
+    const ch = getChannel(c.guildId);
+    if (!ch) return;
+    try {
+      ch.send({ type: "broadcast", event: "state", payload: {
+        from: S.user.id, mic: !!c.mic, cam: !!c.cam, share: !!c.share,
+        name: S.user.name, color: S.user.color
+      } });
+    } catch (e) {}
+  }
+  /* In-place tile refresh — patches a single tile's mic badge / camera state
+     without recreating the DOM (keeps <audio> streams playing seamlessly). */
+  function updateTileFor(uid) {
+    const c = S.call; if (!c) return;
+    const g = guilds()[c.guildId]; if (!g) return;
+    const tile = tileEl(uid);
+    if (!tile) return;
+    const u = users()[uid]; if (!u) return;
+    const self = uid === S.user.id;
+    const r = g.roster[uid] || {};
+    const remoteSt = c.remote[uid];
+    const camOn = self ? c.cam : !!r.cam;
+    const micOn = self ? c.mic : !!r.mic;
+    const hasVid = self ? !!(c.cam && c.stream && c.stream.getVideoTracks().length) : !!(camOn && remoteSt && remoteSt.video);
+    const tag = $(".tile-tag", tile);
+    if (tag) {
+      const mb = $(".mic-badge", tag);
+      if (mb) { mb.className = "mic-badge " + (micOn ? "on" : "off"); mb.innerHTML = ic(micOn ? "mic" : "micOff", 13); }
+      const nm = $(".tile-name", tag);
+      if (nm) nm.textContent = u.name + (self ? "  (you)" : "");
+    }
+    const av = $(".tile-avatar", tile);
+    if (av) av.style.display = (hasVid ? "none" : "");
+    const co = $(".tile-camoff", tile);
+    if (co) co.style.display = (camOn || self || hasVid) ? "none" : "";
+    const vid = byId(self ? "vm-self" : "vm-" + uid);
+    if (vid && !self && hasVid && remoteSt) {
+      if (vid.srcObject !== remoteSt.stream) vid.srcObject = remoteSt.stream;
+      playMedia(vid);
+      vid.hidden = false;
+    } else if (vid && !self) {
+      vid.hidden = true;
+    }
+    attachMedia();
+  }
+  function onStateBroadcast(p) {
+    if (!S.call || !p || !p.from || p.from === S.user.id) return;
+    const g = guilds()[S.call.guildId];
+    if (!g) return;
+    const r = g.roster[p.from];
+    if (!r) return;
+    const prevShare = !!r.share;
+    r.mic = !!p.mic;
+    r.cam = !!p.cam;
+    r.share = !!p.share;
+    if (p.name || p.color) ensureProfile(p.from, p.name, p.color);
+    if (byId("call-view")) {
+      if (r.share !== prevShare) updateStage();
+      else updateTileFor(p.from);
+    } else { appView(); }
+  }
+
   function pushPresence() {
     const c = S.call; if (!c || !S.user) return;
+    sendState();
     writePresence(c.guildId, {
       [S.user.id]: { name: S.user.name, color: S.user.color, mic: !!c.mic, cam: !!c.cam, share: !!c.share, joinedAt: c.joinAt }
     });
@@ -717,6 +798,7 @@ input, textarea, select { font-family: inherit; }
       payload => onSoundboardRealtime(payload));
     ch.on("broadcast", { event: "sb_play" }, p => onSbPlay(p));
     ch.on("broadcast", { event: "wreg" }, p => onRenegotiation(p));
+    ch.on("broadcast", { event: "state" }, p => onStateBroadcast(p));
     ch.on("broadcast", { event: "typing" }, p => onTyping(p));
     ch.on("broadcast", { event: "kick" }, p => { if (S.call && S.call.guildId === gid && p.userId && p.userId === S.user.id) { toast("You were disconnected by a server member.", "err"); leaveCall(); } });
     ch.on("broadcast", { event: "invite" }, p => {
@@ -1610,14 +1692,15 @@ input, textarea, select { font-family: inherit; }
     const c = S.call;
     if (!c || !c.stream || !peerOpen) return;
     const roster = (guilds()[c.guildId] || {}).call || [];
-    roster.forEach(id => { if (id !== S.user.id) callUser(id); });
+    // Lower-id side initiates so we never double-dial the same pair.
+    roster.forEach(id => { if (id !== S.user.id && S.user.id < id) callUser(id); });
   }
   function callUser(uid) {
     const c = S.call;
     if (!c || !c.stream || !peerOpen || !peer) return;
     if (c.peers[uid] && c.peers[uid].open) return;
     try {
-      const mc = peer.call(uid, c.stream);
+      const mc = peer.call(uid, c.stream, { metadata: { kind: "main" } });
       c.peers[uid] = mc;
       mc.on("stream", s => upsertRemote(uid, s));
       mc.on("close", () => cleanupRemote(uid));
@@ -1628,8 +1711,9 @@ input, textarea, select { font-family: inherit; }
     const c = S.call, uid = mc.peer;
     if (!c) { try { mc.close(); } catch (e) {} return; }
     const roster = (guilds()[c.guildId] || {}).roster || {};
-    const haveMain = c.peers[uid] && c.peers[uid].open;
-    const isShare = !!(roster[uid] && roster[uid].share && haveMain);
+    const haveMain = !!(c.peers[uid] && c.peers[uid].open);
+    const isShare = (mc.metadata && mc.metadata.kind === "share") ||
+      (!!(roster[uid] && roster[uid].share) && haveMain);
     if (isShare) {
       try { mc.answer(); } catch (e) {}
       c.shareMc[uid] = mc;
@@ -1639,7 +1723,7 @@ input, textarea, select { font-family: inherit; }
       return;
     }
     try { mc.answer(c.stream || undefined); } catch (e) {}
-    if (!c.peers[uid]) c.peers[uid] = mc;
+    if (!c.peers[uid] || !c.peers[uid].open) c.peers[uid] = mc;
     mc.on("stream", s => upsertRemote(uid, s));
     mc.on("close", () => cleanupRemote(uid));
     mc.on("error", () => cleanupRemote(uid));
@@ -1674,7 +1758,7 @@ input, textarea, select { font-family: inherit; }
     roster.forEach(uid => {
       if (uid === S.user.id) return;
       try {
-        const mc = peer.call(uid, s);
+        const mc = peer.call(uid, s, { metadata: { kind: "share" } });
         c.shareMc[uid] = mc;
         mc.on("error", () => { try { mc.close(); } catch (e) {} });
       } catch (e) {}
@@ -1762,13 +1846,13 @@ input, textarea, select { font-family: inherit; }
     const strip = byId("stage-strip");
     if (!main) return;
     const tiles = g.call.map(id => tileFor(id)).join("");
-    if (SP.on && !c.share) {
-      main.classList.remove("share");
-      main.classList.add("music");
-      renderMusic();
+    if (c.share || c.remoteShare) {
+      main.classList.remove("music");
+      main.classList.add("share");
+      main.innerHTML = shareTile();
       strip.hidden = false;
       strip.innerHTML = tiles;
-    } else if (c.share) {
+    } else if (SP.on) {
       main.classList.remove("music");
       main.classList.add("share");
       main.innerHTML = shareTile();
@@ -1804,16 +1888,17 @@ input, textarea, select { font-family: inherit; }
         '<div class="tile-avatar" style="background:' + u.color + '">' + esc(initials(u.name)) + "</div></div>";
     let body;
     if (self) {
-      body = hasVideo ? '<video id="vm-self" autoplay playsinline muted></video>' : fill;
+      body = (hasVideo ? '<video id="vm-self" autoplay playsinline muted></video>' : fill);
     } else {
-      // Remote tile always keeps its avatar fill; the per-user <video> sits on
-      // top and is revealed only when their actual WebRTC video track arrives.
-      body = fill + '<video id="vm-' + id + '" autoplay playsinline hidden></video>';
+      // Separate <audio> and <video> so audio playback is never killed by hiding the video element.
+      body = fill +
+        '<audio id="va-' + id + '" autoplay playsinline hidden></audio>' +
+        '<video id="vm-' + id + '" autoplay playsinline hidden></video>';
     }
     return '<div class="tile' + (self ? '' : '') + '" data-user-id="' + id + '"' + (self ? ' id="tile-self"' : ' id="tile-' + id + '"') + '">' +
       body +
       (!self && !camOn ? '<div class="tile-camoff">' + ic("camOff", 15) + "</div>" : "") +
-      '<div class="tile-tag"><span class="mic-badge ' + (micOn ? "on" : "off") + '">' + ic(micOn ? "mic" : "micOff", 13) + '</span><span>' + esc(u.name) + (self ? "  (you)" : "") + "</span></div>" +
+      '<div class="tile-tag"><span class="mic-badge ' + (micOn ? "on" : "off") + '">' + ic(micOn ? "mic" : "micOff", 13) + '</span><span class="tile-name">' + esc(u.name) + (self ? "  (you)" : "") + "</span></div>" +
     "</div>";
   }
 
@@ -1848,22 +1933,36 @@ input, textarea, select { font-family: inherit; }
     const c = S.call;
     if (!c) return;
     const roster = (guilds()[c.guildId] || {}).roster || {};
+    // --- local self tile (muted, video only — audio plays through speakers via separate element) ---
     const tv = byId("vm-self");
     if (tv && c.stream && c.cam) {
       if (tv.srcObject !== c.stream) tv.srcObject = c.stream;
       playMedia(tv);
       tv.hidden = false;
     } else if (tv) { tv.hidden = true; tv.srcObject = null; }
+    // --- remote users: separate <audio> (va-*) and <video> (vm-*) elements ---
     Object.keys(c.remote || {}).forEach(uid => {
-      const el = byId("vm-" + uid);
       const r = c.remote[uid];
+      if (!r) return;
+      // Audio element — always bound when audio tracks exist, regardless of camera
+      const av = byId("va-" + uid);
+      if (av && r.audio) {
+        if (av.srcObject !== r.stream) av.srcObject = r.stream;
+        playMedia(av);
+      }
+      // Video element — only bound when cam is on AND WebRTC has video track
+      const el = byId("vm-" + uid);
       const camOn = roster[uid] ? !!roster[uid].cam : true;
-      if (el && r && r.video && camOn) {
+      if (el && r.video && camOn) {
         if (el.srcObject !== r.stream) el.srcObject = r.stream;
         playMedia(el);
         el.hidden = false;
-      } else if (el) { el.hidden = true; el.srcObject = null; }
+      } else if (el) {
+        el.hidden = true;
+        el.srcObject = null;   // safe: audio lives on va-* element
+      }
     });
+    // --- screen share ---
     const sv = byId("share-video");
     const shareStream = c.display || (c.remoteShare ? c.remoteShare.stream : null);
     if (sv && shareStream) {
@@ -1970,7 +2069,10 @@ input, textarea, select { font-family: inherit; }
     openPeers().forEach(uid => {
       if (!vt) return;
       const mc = c.peers[uid];
-      try { mc.peerConnection.addTrack(vt, c.stream); } catch (e) { }
+      try {
+        const sending = mc.peerConnection.getSenders().some(s => s.track === vt);
+        if (!sending) mc.peerConnection.addTrack(vt, c.stream);
+      } catch (e) { }
     });
     openPeers().forEach(uid => sendRenegotiation(uid));
   }
@@ -2030,13 +2132,26 @@ input, textarea, select { font-family: inherit; }
     let hasVideo = false, hasAudio = false;
     try {
       mc.peerConnection.getReceivers().forEach(x => {
-        if (x.track && x.track.kind === "video" && x.track.readyState !== "ended") hasVideo = true;
-        if (x.track && x.track.kind === "audio" && x.track.readyState !== "ended") hasAudio = true;
+        if (!x.track) return;
+        if (x.track.kind === "video" && x.track.readyState !== "ended") {
+          hasVideo = true;
+          if (!r.stream.getVideoTracks().includes(x.track)) r.stream.addTrack(x.track);
+        } else if (x.track.kind === "audio" && x.track.readyState !== "ended") {
+          hasAudio = true;
+          if (!r.stream.getAudioTracks().includes(x.track)) r.stream.addTrack(x.track);
+        }
       });
+      // Prune ended tracks so stale video ever actually shows.
+      r.stream.getTracks().forEach(t => { if (t.readyState === "ended") { try { r.stream.removeTrack(t); } catch (e) {} } });
     } catch (e) {}
     const changed = r.video !== hasVideo || r.audio !== hasAudio;
     r.video = hasVideo; r.audio = hasAudio;
-    if (changed) updateStage();
+    if (changed) {
+      if (byId("call-view") && tileEl(uid)) updateTileFor(uid);
+      else attachMedia();
+    } else {
+      attachMedia();
+    }
   }
 
   async function toggleShare() {
@@ -2178,6 +2293,8 @@ input, textarea, select { font-family: inherit; }
     if (!S.call || !p) return;
     if (p.player && p.player === S.user.id) return;
     sbPlay(p.dataUrl);
+    const nm = displayName(p.player, null);
+    toast((p.emoji || "🔊") + " " + (p.name || "sound") + " — played by " + (nm || "someone"), "info");
   }
   function onSoundboardRealtime(payload) {
     if (!S.call) return;
