@@ -35,6 +35,10 @@
   const prefs = () => lsGet("hc_prefs", { autoMute: false, sounds: true, micId: "", camId: "" });
   const savePrefs = p => lsSet("hc_prefs", p);
 
+  /* ======================= PeerJS State Management ======================= */
+  let currentPeerSessionToken = null;  // Track current session token
+  let peerInitializing = false;        // Prevent double-initialization (React Strict Mode safety)
+
   /* ======================= Supabase data layer ======================= */
   const hashColor = seed => {
     let h = 0; for (const cc of String(seed || "")) h = (h * 31 + cc.charCodeAt(0)) | 0;
@@ -553,6 +557,10 @@
   function boot() {
     if (localStorage.getItem(RESOLVER_CACHE_KEY) === null) markResolverDown();
     if (!supabaseClient) { renderConfigError(); return; }
+    
+    // Initialize PeerJS lifecycle handlers
+    ensureCleanupHandlers();
+    
     document.addEventListener("keydown", e => { if (e.key === "Escape" && S.modalOpen) closeModal(); });
     document.addEventListener("click", e => {
       const m = $(".dropdown:not(.hidden)");
@@ -1162,8 +1170,8 @@
       try { audio.remove(); } catch (e) {} 
     });
     Object.keys(c.remote || {}).forEach(k => unwatchTalkLevel(k));
-    if (peer && !peer.destroyed) { try { peer.destroy(); } catch (e) {} }
-    peer = null; peerOpen = false; peerError = false;
+    // CRITICAL: Clean up PeerJS BEFORE clearing S.call
+    cleanupPeerResources();
     if (c.stream) c.stream.getTracks().forEach(t => t.stop());
     if (c.display) c.display.getTracks().forEach(t => t.stop());
     unwatchTalkLevel(S.user.id);
@@ -1199,13 +1207,71 @@
   }
   function cleanupOnUnload(e) {
     if (e && e.persisted) return;
-    try {
-      if (peer && !peer.destroyed) peer.destroy();
-    } catch (e2) {}
+    console.log("[PeerJS] Page unload detected, performing cleanup");
+
+    // Clean up PeerJS connection
+    cleanupPeerResources();
+
     const c = S.call;
-    if (c) { releaseCallMedia(); beaconPresence(c.guildId); }
+    if (c) {
+      releaseCallMedia();
+      beaconPresence(c.guildId);
+    }
     stopPresenceBeat();
     SB.open = false;
+  }
+
+  /* ======================= PeerJS Lifecycle Handlers ======================= */
+  let cleanupHandlersRegistered = false;
+
+  function registerPeerCleanupHandlers() {
+    // Handle page unload/reload
+    window.addEventListener("beforeunload", (e) => {
+      cleanupPeerResources();
+      if (S.call) beaconPresence(S.call.guildId);
+    });
+
+    // Handle visibility changes (tab backgrounding)
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        console.log("[PeerJS] Page hidden, maintaining connection");
+      } else {
+        console.log("[PeerJS] Page visible, reconnecting if needed");
+        if (S.call && peer && peer.disconnected) {
+          try {
+            peer.reconnect();
+          } catch (e) {
+            console.warn("[PeerJS] Reconnection on page visibility failed:", e);
+          }
+        }
+      }
+    });
+
+    // Handle browser online/offline
+    window.addEventListener("offline", () => {
+      console.warn("[PeerJS] Network offline detected");
+      if (peer && !peer.disconnected) {
+        try { peer.disconnect(); } catch (e) {}
+      }
+    });
+
+    window.addEventListener("online", () => {
+      console.log("[PeerJS] Network online, attempting reconnection");
+      if (S.call && peer && peer.disconnected) {
+        try {
+          peer.reconnect();
+        } catch (e) {
+          console.warn("[PeerJS] Reconnection on network online failed:", e);
+        }
+      }
+    });
+  }
+
+  function ensureCleanupHandlers() {
+    if (!cleanupHandlersRegistered) {
+      registerPeerCleanupHandlers();
+      cleanupHandlersRegistered = true;
+    }
   }
 
   let presenceBeatI = null;
@@ -1269,24 +1335,169 @@
   }
   function setInCallFlag() { try { document.body.classList.toggle("in-call", !!S.call); } catch (e) {} }
 
+  /* ======================= PeerJS Initialization Helpers ======================= */
+  // UUID v4-like generator for unique session tokens
+  const generateSessionToken = () => {
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+      const r = Math.random() * 16 | 0;
+      const v = c === 'x' ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  };
+
+  // Generate unique peer ID with session token to prevent collisions
+  function generateUniquePeerId(userId) {
+    const sessionToken = generateSessionToken();
+    currentPeerSessionToken = sessionToken;
+    return `${userId}#${sessionToken}`;
+  }
+
+  // Destroy peer and release all resources
+  function destroyPeer() {
+    if (!peer) return;
+
+    try {
+      // Disconnect all active connections
+      if (peer._connections) {
+        Object.values(peer._connections).forEach(conns => {
+          if (Array.isArray(conns)) {
+            conns.forEach(conn => {
+              try { if (conn.close && !conn.closed) conn.close(); } catch (e) {}
+            });
+          }
+        });
+      }
+
+      // Safely disconnect and destroy
+      if (!peer.disconnected) {
+        try { peer.disconnect(); } catch (e) {}
+      }
+
+      if (!peer.destroyed) {
+        try { peer.destroy(); } catch (e) {}
+      }
+    } catch (e) {
+      console.warn("[PeerJS] Error during destruction:", e);
+    } finally {
+      peer = null;
+      peerOpen = false;
+      currentPeerSessionToken = null;
+    }
+  }
+
+  // Centralized cleanup function for all peer resources
+  function cleanupPeerResources() {
+    console.log("[PeerJS] Cleaning up peer resources");
+
+    // Close all media connections
+    if (peer && peer._connections) {
+      Object.entries(peer._connections).forEach(([peerId, connections]) => {
+        if (Array.isArray(connections)) {
+          connections.forEach(conn => {
+            try {
+              if (conn.close && !conn.closed) conn.close();
+            } catch (e) {
+              console.warn(`[PeerJS] Error closing connection to ${peerId}:`, e);
+            }
+          });
+        }
+      });
+    }
+
+    // Destroy peer
+    destroyPeer();
+  }
+
   let peer = null, peerOpen = false, peerError = false;
   function getPeer() {
     if (typeof window.Peer === "undefined") {
-      if (!peerError) { peerError = true; toast("PeerJS network is ready in the <head> tag — it seems to be missing.", "err"); }
+      if (!peerError) {
+        peerError = true;
+        toast("PeerJS network is ready in the <head> tag — it seems to be missing.", "err");
+      }
       return null;
     }
+
+    // Return existing healthy peer
     if (peer && !peer.destroyed) {
-      if (peer.disconnected) { try { peer.reconnect(); } catch (e) {} }
+      if (peer.disconnected) {
+        try { peer.reconnect(); } catch (e) {}
+      }
       return peer;
     }
+
+    // Prevent concurrent initialization (Strict Mode safety)
+    if (peerInitializing) {
+      console.warn("[PeerJS] Initialization already in progress, skipping duplicate attempt");
+      return null;
+    }
+
+    peerInitializing = true;
     peerError = false;
-    peer = new window.Peer(S.user.id, { debug: 1 });
-    peer.on("open", () => { peerOpen = true; tryMesh(); ensureShareMesh(); });
-    peer.on("disconnected", () => { if (S.call) { try { peer.reconnect(); } catch (e) {} } });
-    peer.on("close", () => { peerOpen = false; });
-    peer.on("error", e => { peerError = true; if (e && e.type === "unavailable-id") console.warn("peer id conflict", e); });
-    peer.on("call", onIncomingCall);
-    return peer;
+
+    try {
+      // Generate unique peer ID with session token
+      const uniquePeerId = generateUniquePeerId(S.user.id);
+      console.log(`[PeerJS] Initializing with ID: ${uniquePeerId}`);
+
+      peer = new window.Peer(uniquePeerId, {
+        debug: 1,
+      });
+
+      peer.on("open", () => {
+        console.log(`[PeerJS] Connection opened for session ${currentPeerSessionToken}`);
+        peerOpen = true;
+        peerInitializing = false;
+        tryMesh();
+        ensureShareMesh();
+      });
+
+      peer.on("disconnected", () => {
+        console.warn("[PeerJS] Peer disconnected");
+        peerOpen = false;
+        
+        if (S.call) {
+          try { peer.reconnect(); } catch (e) {}
+        }
+      });
+
+      peer.on("close", () => {
+        console.log("[PeerJS] Peer connection closed");
+        peerOpen = false;
+        peer = null;
+      });
+
+      peer.on("error", (error) => {
+        console.error("[PeerJS] Error event:", error);
+        peerError = true;
+
+        // Handle ID collision with retry
+        if (error && error.type === "unavailable-id") {
+          console.error("[PeerJS] ID collision detected! Retrying with new session...");
+          destroyPeer();
+          // Exponential backoff: 1-3 seconds
+          setTimeout(() => {
+            peerInitializing = false;
+            getPeer();
+          }, 1000 + Math.random() * 2000);
+        }
+
+        if (error && error.type === "peer-unavailable") {
+          console.warn("[PeerJS] Peer unavailable:", error);
+        }
+      });
+
+      peer.on("call", onIncomingCall);
+
+      return peer;
+
+    } catch (err) {
+      console.error("[PeerJS] Exception during initialization:", err);
+      peerError = true;
+      peerInitializing = false;
+      peer = null;
+      return null;
+    }
   }
   function tryMesh() {
     const c = S.call;
@@ -1298,13 +1509,24 @@
     const c = S.call;
     if (!c || !c.stream || !peerOpen || !peer) return;
     if (c.peers[uid] && c.peers[uid].open) return;
+
     try {
+      console.log(`[PeerJS] Calling user ${uid}`);
       const mc = peer.call(uid, c.stream, { metadata: { kind: "main" } });
       c.peers[uid] = mc;
+      
       mc.on("stream", s => upsertRemote(uid, s));
-      mc.on("close", () => cleanupRemote(uid));
-      mc.on("error", () => cleanupRemote(uid));
-    } catch (e) { console.warn("callUser failed", uid, e); }
+      mc.on("close", () => {
+        console.log(`[PeerJS] Call closed with ${uid}`);
+        cleanupRemote(uid);
+      });
+      mc.on("error", (err) => {
+        console.error(`[PeerJS] Error on call with ${uid}:`, err);
+        cleanupRemote(uid);
+      });
+    } catch (e) {
+      console.error("[PeerJS] callUser failed for", uid, e);
+    }
   }
   function onIncomingCall(mc) {
     const c = S.call, uid = mc.peer;
@@ -1353,8 +1575,14 @@
     try { mc.answer(c.stream || undefined); } catch (e) {}
     if (!c.peers[uid] || !c.peers[uid].open) c.peers[uid] = mc;
     mc.on("stream", s => upsertRemote(uid, s));
-    mc.on("close", () => cleanupRemote(uid));
-    mc.on("error", () => cleanupRemote(uid));
+    mc.on("close", () => {
+      console.log(`[PeerJS] Incoming call closed from ${uid}`);
+      cleanupRemote(uid);
+    });
+    mc.on("error", (err) => {
+      console.error(`[PeerJS] Error on incoming call from ${uid}:`, err);
+      cleanupRemote(uid);
+    });
   }
   function upsertRemote(uid, src) {
     const c = S.call; if (!c) return;
