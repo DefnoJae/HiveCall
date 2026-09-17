@@ -657,11 +657,13 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     const prevCall = g.call || [];
     const prevRoster = g.roster || {};
     const roster = {};
-    let music = null, soundEdits = null;
+    let music = null;
     Object.keys(obj).forEach(k => {
       const v = obj[k];
       if (k === "_music" && v && typeof v === "object") { music = v; return; }
-      if (k === "_soundboard" && v && typeof v === "object") { soundEdits = v; return; }
+      // Presence documents may contain reserved metadata. Never render a
+      // metadata key as a call participant.
+      if (k.charAt(0) === "_") return;
       if (!v || typeof v !== "object") return;
       roster[k] = v;
       ensureProfile(k, v.name, v.color);
@@ -692,17 +694,6 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     // Anyone who is no longer in the call loses their green speaking ring too.
     Object.keys(talkState).forEach(uid => { if (!roster[uid]) clearTalkState(uid); });
     if (music && music.queue) S.callMusic = music;
-    if (soundEdits) {
-      const rows = DB.soundboards[g.id] || [];
-      Object.keys(soundEdits).forEach(id => {
-        const edit = soundEdits[id];
-        const row = rows.find(x => String(x.id) === String(id));
-        if (!row || !edit || typeof edit !== "object") return;
-        if (typeof edit.name === "string") row.name = edit.name;
-        if (typeof edit.emoji === "string") row.emoji = edit.emoji;
-      });
-      if (S.call && S.call.guildId === g.id && byId("sb-panel") && SB.open) renderSoundboard();
-    }
     if (origin === "rt" && S.call && S.call.guildId === g.id) {
       g.call.filter(id => !prevCall.includes(id) && id !== S.user.id).forEach(id => {
         toast(displayName(id, roster[id] && roster[id].name) + " joined the call.", "info");
@@ -771,6 +762,9 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
           const { data } = await supabaseClient.from("call_presence").select("server_id,active_users").eq("server_id", gid).maybeSingle();
           if (data && data.active_users && typeof data.active_users !== "object") return;
           const obj = Object.assign({}, data && data.active_users || {});
+          // A prior build persisted sound-board state under this reserved key.
+          // It is not a participant and is removed on the next normal presence write.
+          delete obj._soundboard;
           Object.keys(patch).forEach(k => { if (patch[k] === null) delete obj[k]; else obj[k] = patch[k]; });
           if (data) await supabaseClient.from("call_presence").update({ active_users: obj }).eq("server_id", gid);
           else await supabaseClient.from("call_presence").insert({ server_id: gid, active_users: obj });
@@ -886,7 +880,6 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     ch.on("postgres_changes", { event: "*", schema: "public", table: "soundboard", filter: "server_id=eq." + gid },
       payload => onSoundboardRealtime(payload));
     ch.on("broadcast", { event: "sb_play" }, p => onSbPlay(p));
-    ch.on("broadcast", { event: "sb_update" }, p => onSbUpdate(p));
     ch.on("broadcast", { event: "wreg" }, p => onRenegotiation(p));
     ch.on("broadcast", { event: "state" }, p => onStateBroadcast(p));
     ch.on("broadcast", { event: "talk" }, p => onTalkBroadcast(p));
@@ -1049,14 +1042,6 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     root.appendChild(el);
     requestAnimationFrame(() => el.classList.add("show"));
     setTimeout(() => { el.classList.remove("show"); setTimeout(() => el.remove(), 300); }, 2800);
-  }
-  function pushSoundboardEdit(id, name, emoji) {
-    const c = S.call;
-    if (!c || !id) return;
-    const mirror = ROSTER_MIRROR[c.guildId] || {};
-    const edits = Object.assign({}, mirror._soundboard || {});
-    edits[id] = { name, emoji, at: Date.now() };
-    writePresence(c.guildId, { _soundboard: edits });
   }
   const soundNoticeAt = {};
   function soundPlayedNotice(p) {
@@ -1980,24 +1965,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
         if (c.sharePending && roster[uid] && roster[uid].share) c.sharePending[uid] = true;
         updateStage();
       };
-      mc.on("stream", s => {
-        c.remoteShare = { id: uid, stream: s };
-        if (c.sharePending) delete c.sharePending[uid];
-        const refreshShare = () => {
-          if (!S.call || S.call !== c || !c.remoteShare || c.remoteShare.stream !== s) return;
-          updateStage();
-          setTimeout(attachMedia, 0);
-        };
-        // Some browsers deliver a live screen track before it has actual
-        // frames. Re-attach it when frames become available instead of leaving
-        // the remote viewer on a black <video>.
-        s.getVideoTracks().forEach(t => {
-          t.addEventListener("unmute", refreshShare);
-          t.addEventListener("ended", drop);
-        });
-        s.addEventListener("addtrack", refreshShare);
-        refreshShare();
-      });
+      mc.on("stream", s => { c.remoteShare = { id: uid, stream: s }; if (c.sharePending) delete c.sharePending[uid]; updateStage(); });
       mc.on("close", drop);
       mc.on("error", drop);
       return;
@@ -2303,12 +2271,8 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     const shareStream = c.display || (c.remoteShare ? c.remoteShare.stream : null);
     if (sv && shareStream) {
       if (sv.srcObject !== shareStream) sv.srcObject = shareStream;
-      sv.autoplay = true;
-      sv.playsInline = true;
       sv.muted = !!c.share;          // mute own screen-share preview (echo)
       playMedia(sv);
-      sv.onloadedmetadata = () => playMedia(sv);
-      sv.oncanplay = () => playMedia(sv);
       sv.hidden = false;
     } else if (sv) { sv.hidden = true; sv.srcObject = null; }
   }
@@ -2797,16 +2761,6 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     } catch (err) {}
     renderSoundboard();
   }
-  function onSbUpdate(p) {
-    p = broadcastPayload(p);
-    if (!S.call || !p || !p.id) return;
-    const rows = DB.soundboards[S.call.guildId] || [];
-    const row = rows.find(x => x.id === p.id);
-    if (!row) return;
-    if (typeof p.name === "string") row.name = p.name;
-    if (typeof p.emoji === "string") row.emoji = p.emoji;
-    renderSoundboard();
-  }
   function toggleSoundboard() {
     if (!S.call) return;
     SB.open = !SB.open;
@@ -2894,21 +2848,13 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       const name = (input && input.value || "").trim();
       const emoji = (emojiInput && emojiInput.value || "🔊").trim() || "🔊";
       if (!name) return toast("Give the sound a name.", "err");
-      supabaseClient.from("soundboard").update({ name, emoji }).eq("id", s.id).eq("server_id", S.call.guildId).select("id,name,emoji")
-        .then(({ data, error }) => {
+      supabaseClient.from("soundboard").update({ name, emoji }).eq("id", s.id).eq("server_id", S.call.guildId)
+        .then(({ error }) => {
           if (error) return toast("Could not rename sound: " + error.message, "err");
           const local = sbAllInCall().find(x => x.id === s.id);
           if (local) { local.name = name; local.emoji = emoji; }
-          // A restrictive RLS policy can report success while updating zero
-          // table rows. Keep the edit in the shared call snapshot as well so
-          // every active participant, including a refreshed client, sees it.
-          pushSoundboardEdit(s.id, name, emoji);
-          const ch = getChannel(S.call.guildId);
-          if (ch) {
-            try { ch.send({ type: "broadcast", event: "sb_update", payload: { id: s.id, name, emoji, by: S.user.id } }); } catch (e) {}
-          }
           closeModal(); renderSoundboard();
-          toast((data && data.length ? "Updated " : "Updated for this call: ") + emoji + " " + name + ".", "ok");
+          toast("Updated " + emoji + " " + name + ".", "ok");
         });
     };
     byId("sb-rename-save").addEventListener("click", save);
