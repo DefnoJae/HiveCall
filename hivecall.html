@@ -657,10 +657,11 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     const prevCall = g.call || [];
     const prevRoster = g.roster || {};
     const roster = {};
-    let music = null;
+    let music = null, soundEdits = null;
     Object.keys(obj).forEach(k => {
       const v = obj[k];
       if (k === "_music" && v && typeof v === "object") { music = v; return; }
+      if (k === "_soundboard" && v && typeof v === "object") { soundEdits = v; return; }
       if (!v || typeof v !== "object") return;
       roster[k] = v;
       ensureProfile(k, v.name, v.color);
@@ -691,6 +692,17 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     // Anyone who is no longer in the call loses their green speaking ring too.
     Object.keys(talkState).forEach(uid => { if (!roster[uid]) clearTalkState(uid); });
     if (music && music.queue) S.callMusic = music;
+    if (soundEdits) {
+      const rows = DB.soundboards[g.id] || [];
+      Object.keys(soundEdits).forEach(id => {
+        const edit = soundEdits[id];
+        const row = rows.find(x => String(x.id) === String(id));
+        if (!row || !edit || typeof edit !== "object") return;
+        if (typeof edit.name === "string") row.name = edit.name;
+        if (typeof edit.emoji === "string") row.emoji = edit.emoji;
+      });
+      if (S.call && S.call.guildId === g.id && byId("sb-panel") && SB.open) renderSoundboard();
+    }
     if (origin === "rt" && S.call && S.call.guildId === g.id) {
       g.call.filter(id => !prevCall.includes(id) && id !== S.user.id).forEach(id => {
         toast(displayName(id, roster[id] && roster[id].name) + " joined the call.", "info");
@@ -1037,6 +1049,14 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     root.appendChild(el);
     requestAnimationFrame(() => el.classList.add("show"));
     setTimeout(() => { el.classList.remove("show"); setTimeout(() => el.remove(), 300); }, 2800);
+  }
+  function pushSoundboardEdit(id, name, emoji) {
+    const c = S.call;
+    if (!c || !id) return;
+    const mirror = ROSTER_MIRROR[c.guildId] || {};
+    const edits = Object.assign({}, mirror._soundboard || {});
+    edits[id] = { name, emoji, at: Date.now() };
+    writePresence(c.guildId, { _soundboard: edits });
   }
   const soundNoticeAt = {};
   function soundPlayedNotice(p) {
@@ -2874,17 +2894,21 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       const name = (input && input.value || "").trim();
       const emoji = (emojiInput && emojiInput.value || "🔊").trim() || "🔊";
       if (!name) return toast("Give the sound a name.", "err");
-      supabaseClient.from("soundboard").update({ name, emoji }).eq("id", s.id).eq("server_id", S.call.guildId)
-        .then(({ error }) => {
+      supabaseClient.from("soundboard").update({ name, emoji }).eq("id", s.id).eq("server_id", S.call.guildId).select("id,name,emoji")
+        .then(({ data, error }) => {
           if (error) return toast("Could not rename sound: " + error.message, "err");
           const local = sbAllInCall().find(x => x.id === s.id);
           if (local) { local.name = name; local.emoji = emoji; }
+          // A restrictive RLS policy can report success while updating zero
+          // table rows. Keep the edit in the shared call snapshot as well so
+          // every active participant, including a refreshed client, sees it.
+          pushSoundboardEdit(s.id, name, emoji);
           const ch = getChannel(S.call.guildId);
           if (ch) {
             try { ch.send({ type: "broadcast", event: "sb_update", payload: { id: s.id, name, emoji, by: S.user.id } }); } catch (e) {}
           }
           closeModal(); renderSoundboard();
-          toast("Updated " + emoji + " " + name + ".", "ok");
+          toast((data && data.length ? "Updated " : "Updated for this call: ") + emoji + " " + name + ".", "ok");
         });
     };
     byId("sb-rename-save").addEventListener("click", save);
