@@ -16,34 +16,20 @@
   const djb2 = s => { let h = 5381; for (const c of s) h = ((h << 5) + h + c.charCodeAt(0)) | 0; return "h" + (h >>> 0).toString(36); };
 
   /* ======================= Supabase + PeerJS setup ======================= */
-  /* Required (already provisioned, per the agreed schema):
-       servers(id, name, owner_id, invite_code)
-       server_members(server_id, user_id)  — composite PK (server_id, user_id)
-       messages(id, server_id, user_id, user_name, user_color, content, created_at)
-       call_presence(server_id, active_users jsonb)  — one row per server; keeps the roster + "_music"
-       soundboard(id, server_id, user_id, name, emoji, data_url, created_at)
-     Display names/colors come from auth.users user_metadata (display_name, color)
-     and from the user_name/user_color columns on messages + call_presence roster.
-     Real-time must be enabled for: messages, call_presence, soundboard (+ broadcast).
-     Realtime channel "hc-<server_id>" uses broadcasts: sb_play, kick, invite.
-     RLS with the anon key must allow the row ops the app performs. */
   const SUPABASE_URL = "https://xheyslqfzvidoaczlmxz.supabase.co";
   const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhoZXlzbHFmenZpZG9hY3psbXh6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODkzNTIwNTQsImV4cCI6MjEwNDkyODA1NH0.1r1B2H0_51wTDxoaj8v4XF8SYZTsSoiDj42i94hPVyg";
   const supabaseClient = (window.supabase && window.supabase.createClient)
     ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
     : null;
 
-  /* Optimistic runtime mirrors — filled from Supabase by refreshData().
-     guilds() = servers keyed by id (with .members/.call/.chat mirrors),
-     users()  = profiles (name/color) keyed by Supabase user id. */
+  /* Optimistic runtime mirrors */
   let DB = { servers: {}, profiles: {}, soundboards: {} };
   const guilds = () => DB.servers;
   const users = () => DB.profiles;
   const saveGuilds = ob => { DB.servers = ob || DB.servers; };
   const saveUsers = ob => { DB.profiles = ob || DB.profiles; };
 
-  /* Device-local prefs ONLY (resolution caches, api keys, settings).
-     No accounts, servers, messages, or calls live in localStorage any more. */
+  /* Device-local prefs ONLY */
   const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } };
   const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
   const prefs = () => lsGet("hc_prefs", { autoMute: false, sounds: true, micId: "", camId: "" });
@@ -60,7 +46,6 @@
     createdAt: Date.parse(r.created_at || 0) || 0
   });
 
-  /* Server + profile mirror: servers we belong to, plus every member's (name,color). */
   async function refreshData() {
     if (!supabaseClient || !S.user) return;
     try {
@@ -113,7 +98,6 @@
     text: r.content, at: Date.parse(r.created_at) || Date.now()
   } : null;
 
-  /* Call presence: one row per server, active_users jsonb (roster + "_music"). */
   const ROSTER_MIRROR = {};
   async function loadPresence(g) {
     try {
@@ -136,10 +120,6 @@
       roster[k] = v;
       ensureProfile(k, v.name, v.color);
     });
-    // "active_users" is a read-modify-write JSON blob, so two people writing
-    // presence at the same moment can briefly clobber each other. Never drop
-    // ourselves, or a peer we hold an open WebRTC connection to, on a realtime
-    // update: that is what made people look kicked out of the call.
     if (origin === "rt" && S.call && S.call.guildId === g.id) {
       if (S.user && !roster[S.user.id]) {
         const mine = users()[S.user.id] || { name: S.user.name, color: S.user.color };
@@ -159,7 +139,6 @@
     }
     g.call = Object.keys(roster);
     g.roster = roster;
-    // Anyone who is no longer in the call loses their green speaking ring too.
     Object.keys(talkState).forEach(uid => { if (!roster[uid]) clearTalkState(uid); });
     if (music && music.queue) S.callMusic = music;
     if (origin === "rt" && S.call && S.call.guildId === g.id) {
@@ -175,8 +154,6 @@
       prevCall.filter(id => !((roster[id] || {}).share) && !!((prevRoster[id] || {}).share)).forEach(id => {
         toast(displayName(id, prevRoster[id] && prevRoster[id].name) + " stopped sharing their screen.", "info");
       });
-      // Show "X is presenting" as soon as presence says so, even before the
-      // screen media connection has finished negotiating.
       if (S.call.sharePending) {
         Object.keys(roster).forEach(id => {
           if (id === S.user.id) return;
@@ -187,10 +164,9 @@
     }
     if (origin !== "local" && S.call && S.call.guildId === g.id) {
       if (music && music.queue && SP.on) applySpotifySync(music);
-      // Dial users we aren't connected to yet (lower-id initiates to avoid double-dials).
       if (peerOpen && S.call && S.call.guildId === g.id) {
         g.call.forEach(id => { if (id !== S.user.id && S.user.id < id) callUser(id); });
-        if (S.call.share) ensureShareMesh();     // late joiners get the screen share too
+        if (S.call.share) ensureShareMesh();
       }
       if (byId("call-view")) {
         const added = g.call.some(id => !prevCall.includes(id));
@@ -217,14 +193,10 @@
     } catch (e) { console.warn("loadSoundboard failed", e); }
   }
 
-  /* Presence writes are read-merge-write and serialized so concurrent toggles
-     from in-call users don't clobber each other. */
   let presenceQueue = Promise.resolve();
   function writePresence(gid, patch) {
     if (!supabaseClient || !gid) return;
     presenceQueue = presenceQueue.then(async () => {
-      // Read-modify-write races with other clients, so retry once instead of
-      // silently losing our own roster entry.
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           const { data } = await supabaseClient.from("call_presence").select("server_id,active_users").eq("server_id", gid).maybeSingle();
@@ -241,9 +213,6 @@
     });
   }
 
-  /* Instant (broadcast) mic/cam/share state propagation — mirrors pushPresence
-     without waiting for the DB roundtrip. DB presence still records the state
-     for anyone who joins later. */
   function sendState() {
     const c = S.call;
     if (!c || !S.user || !supabaseClient) return;
@@ -256,8 +225,6 @@
       } });
     } catch (e) {}
   }
-  /* In-place tile refresh — patches a single tile's mic badge / camera state
-     without recreating the DOM (keeps <audio> streams playing seamlessly). */
   function updateTileFor(uid) {
     const c = S.call; if (!c) return;
     const g = guilds()[c.guildId]; if (!g) return;
@@ -303,7 +270,6 @@
     r.cam = !!p.cam;
     r.share = !!p.share;
     if (p.name || p.color) ensureProfile(p.from, p.name, p.color);
-    // "X is presenting" needs to appear instantly (the DB presence event lags).
     if (S.call.sharePending) {
       if (r.share && !prevShare) S.call.sharePending[p.from] = true;
       if (!r.share) delete S.call.sharePending[p.from];
@@ -328,10 +294,14 @@
     });
   }
 
-  /* Real-time channels: messages, call_presence, soundboard + broadcast. */
+  /* Real-time channels */
   let hcChannels = [];
   function closeRealtime() { hcChannels.forEach(ch => { try { supabaseClient.removeChannel(ch); } catch (e) {} }); hcChannels = []; }
-  function getChannel(gid) { return hcChannels.find(ch => ch.topic === "hc-" + gid) || null; }
+  
+  // FIX: Supabase JS v2 prepends "realtime:" to the topic property internally. 
+  // By matching on index 0 directly, we bypass any topic parsing issues ensuring broadcasts always send properly!
+  function getChannel(gid) { return hcChannels[0] || null; }
+  
   function openRealtime(gid) {
     if (!supabaseClient) return;
     closeRealtime();
@@ -359,6 +329,7 @@
         toast((me ? me.name : "A server member") + " invited you to the Voice Lounge" + (gg ? " in " + gg.name : "") + "!", "info");
       }
     });
+    ch.on("broadcast", { event: "music_invite" }, p => onMusicInvite(p, gid));
     ch.subscribe();
     hcChannels = [ch];
   }
@@ -380,8 +351,6 @@
     const m = mapMsgRow(r); if (!m) return;
     const chat = g.chat || (g.chat = []);
     if (chat.some(x => x.id === m.id)) return;
-    // A locally optimistically-appended message has a temp id — swap it with the
-    // real database id so the Realtime echo never renders a second copy.
     const tmpIdx = chat.findIndex(x => x.pending && x.authorId === m.authorId && x.text === m.text && Math.abs((x.at || 0) - (m.at || 0)) < 7000);
     if (tmpIdx !== -1) {
       const tmp = chat[tmpIdx];
@@ -582,9 +551,6 @@
 
   /* ======================= auth ======================= */
   function boot() {
-    // Force resolvers to be considered "down" on first load so every track
-    // plays instantly via YouTube IFrame. Re-enable probing with the
-    // "↻ Retry resolvers now" button in the Playback Logs panel.
     if (localStorage.getItem(RESOLVER_CACHE_KEY) === null) markResolverDown();
     if (!supabaseClient) { renderConfigError(); return; }
     document.addEventListener("keydown", e => { if (e.key === "Escape" && S.modalOpen) closeModal(); });
@@ -594,12 +560,8 @@
     });
     window.addEventListener("pagehide", e => cleanupOnUnload(e));
     window.addEventListener("beforeunload", () => cleanupOnUnload({ persisted: false }));
-    // Backgrounding a tab/app is not leaving the call: re-assert presence and
-    // wake frozen media up again as soon as the page is visible/focused.
     document.addEventListener("visibilitychange", () => { if (!document.hidden) onPageResumed(); });
     window.addEventListener("focus", () => onPageResumed());
-    // Media playback and talking-ring analysers may be blocked until the page
-    // has a user gesture — every gesture is a chance to start them.
     ["click", "pointerdown", "keydown", "touchstart"].forEach(ev =>
       document.addEventListener(ev, () => { resumeTalkContexts(); kickMediaPlayback(); }, true));
     supabaseClient.auth.getSession().then(({ data }) => {
@@ -746,7 +708,6 @@
       goHome();
       toast("Welcome to HiveCall, " + name + "!", "ok");
     } else {
-      // Email confirmation enabled in Supabase — ask the user to confirm.
       byId("auth-form").innerHTML =
         '<h2>Check your email</h2>' +
         '<p class="sub">We sent a confirmation link to <b>' + esc(email) + '</b>. Confirm it, then sign in.</p>' +
@@ -761,7 +722,6 @@
     if (!email || !pass) return authError("Enter your email and password.");
     const { error } = await supabaseClient.auth.signInWithPassword({ email, password: pass });
     if (error) return authError(error.message);
-    // onAuthStateChange(SIGNED_IN) → refreshAndGo → goHome
     toast("Signed in.", "ok");
   }
 
@@ -797,7 +757,6 @@
       name: name || randServerName(), owner_id: S.user.id, invite_code: invite
     }).select().single();
     if (error || !data) { toast("Could not create the server (" + (error ? error.message : "no row") + ").", "err"); return null; }
-    // Membership (carries name/color so member lists work everywhere).
     await upsertMember(data.id);
     const g = mapServerRow(data);
     g.members = [S.user.id];
@@ -1061,7 +1020,6 @@
     input.addEventListener("keydown", e => { if (e.key === "Enter") send(); });
   }
 
-  /* ---------- typing indicators (broadcast "typing" + 2.5s throttle, 4s expiry) ---------- */
   let typers = {}, typLastSent = 0, typTimer = null;
   function typingHTML() {
     const me = (S.user && S.user.id) || "";
@@ -1155,7 +1113,6 @@
   function joinCall() {
     const g = guild();
     if (!g || !S.user || !supabaseClient) return;
-    // Already connected in this server's call → just bring the overlay back.
     if (S.call) {
       if (S.call.guildId === g.id) {
         renderCall();
@@ -1164,23 +1121,29 @@
       return;
     }
     if (SP.on) stopSpotify();
+    
+    // FIX: Respect user's device preference. If `autoMute` is NOT active, user joins with mic UNMUTED!
+    // This allows other peers to instantly hear them upon joining.
+    const p = prefs();
+    const initialMic = !p.autoMute;
+    
     const now = Date.now();
     S.call = {
-      guildId: g.id, joinAt: now, mic: false, cam: false, share: false,
+      guildId: g.id, joinAt: now, mic: initialMic, cam: false, share: false,
       stream: null, display: null, hasMedia: false, shareWaiting: false,
       peers: {}, shareMc: {}, soundMc: [], soundLocal: [], soundRemote: [], remote: {}, remoteShare: null, sharePending: {}
     };
-    // Reflect self in the roster immediately (locally + Supabase).
     g.roster = g.roster || {};
-    g.roster[S.user.id] = { name: S.user.name, color: S.user.color, mic: false, cam: false, share: false, joinedAt: now };
+    g.roster[S.user.id] = { name: S.user.name, color: S.user.color, mic: initialMic, cam: false, share: false, joinedAt: now };
     if (!g.call.includes(S.user.id)) g.call.push(S.user.id);
     if (!DB.profiles[S.user.id]) DB.profiles[S.user.id] = { id: S.user.id, name: S.user.name, color: S.user.color };
-    writePresence(g.id, { [S.user.id]: { name: S.user.name, color: S.user.color, mic: false, cam: false, share: false, joinedAt: now } });
+    writePresence(g.id, { [S.user.id]: { name: S.user.name, color: S.user.color, mic: initialMic, cam: false, share: false, joinedAt: now } });
     renderCall();
     bootMedia();
     startCallTimer();
     startPresenceBeat();
     playChime();
+    scheduleMusicInviteCheck();
     toast("Joined " + g.name + " · Voice Lounge", "ok");
   }
 
@@ -1188,15 +1151,16 @@
     const c = S.call;
     if (!c) return;
     const gid = c.guildId;
-    // Stop every stream/element we own *before* the call view is discarded:
-    // detached media elements keep playing otherwise.
     releaseCallMedia();
     stopPresenceBeat();
     Object.keys(c.peers || {}).forEach(k => { try { c.peers[k].close(); } catch (e) {} });
     Object.keys(c.shareMc || {}).forEach(k => { try { c.shareMc[k].close(); } catch (e) {} });
     (c.soundMc || []).forEach(mc => { try { mc.close(); } catch (e) {} });
     (c.soundLocal || []).forEach(item => { try { item.audio.pause(); item.audio.src = ""; } catch (e) {} try { item.ctx.close(); } catch (e) {} });
-    (c.soundRemote || []).forEach(audio => { try { audio.pause(); audio.srcObject = null; } catch (e) {} });
+    (c.soundRemote || []).forEach(audio => { 
+      try { audio.pause(); audio.srcObject = null; } catch (e) {}
+      try { audio.remove(); } catch (e) {} 
+    });
     Object.keys(c.remote || {}).forEach(k => unwatchTalkLevel(k));
     if (peer && !peer.destroyed) { try { peer.destroy(); } catch (e) {} }
     peer = null; peerOpen = false; peerError = false;
@@ -1216,11 +1180,10 @@
     toast("You left the call.", "info");
   }
 
-  /* ---------------- disconnect cleanup (tab close / navigation) ---------------- */
   function beaconPresence(gid) {
     if (!supabaseClient || !S.user || gid == null) return;
     const bak = ROSTER_MIRROR[gid];
-    if (!bak) return;   // nothing known locally → skip (leaveCall path already handled)
+    if (!bak) return;
     let next = bak;
     try { next = JSON.parse(JSON.stringify(bak)); } catch (e) { return; }
     delete next[S.user.id];
@@ -1235,25 +1198,19 @@
     try { fetch(url + "?on_conflict=server_id", opt).catch(() => {}); } catch (e) {}
   }
   function cleanupOnUnload(e) {
-    // A bfcache/background page has not really been left — only tear the call
-    // down (and remove ourselves from presence) on a real unload.
     if (e && e.persisted) return;
     try {
       if (peer && !peer.destroyed) peer.destroy();
     } catch (e2) {}
     const c = S.call;
-    if (c) { releaseCallMedia(); beaconPresence(c.guildId); }   // remove self from active_users
+    if (c) { releaseCallMedia(); beaconPresence(c.guildId); }
     stopPresenceBeat();
     SB.open = false;
   }
 
-  /* ---------------- staying connected (switching tabs ≠ leaving) ---------------- */
   let presenceBeatI = null;
   function startPresenceBeat() {
     stopPresenceBeat();
-    // Re-assert our roster entry: a raced/clobbered presence write (or a
-    // backgrounded page) would otherwise leave us "kicked" until the next
-    // mic/cam/share toggle.
     presenceBeatI = setInterval(() => {
       if (!S.call) { stopPresenceBeat(); return; }
       pushPresence();
@@ -1269,8 +1226,6 @@
     tryMesh();
     ensureShareMesh();
   }
-  /* Browsers refuse to autoplay until the page has a gesture — retry any call
-     media that stayed frozen (silent call, black screen share). */
   function kickMediaPlayback() {
     const c = S.call;
     if (!c) return;
@@ -1284,9 +1239,6 @@
     if (sv && sv.srcObject && !sv.muted && sv.paused) stale = true;
     if (stale) attachMedia();
   }
-  /* A detached <audio>/<video> keeps playing after the call view is torn down,
-     which is why people could still hear the call after they left. Release
-     every stream explicitly. */
   function releaseCallMedia() {
     $$("audio, video").forEach(el => {
       if (!el.closest || !el.closest("#call-view")) return;
@@ -1308,6 +1260,7 @@
       (c.soundRemote || []).forEach(a => {
         try { a.pause(); } catch (e) {}
         try { a.srcObject = null; } catch (e) {}
+        try { a.remove(); } catch (e) {}
       });
       c.soundRemote.length = 0;
     }
@@ -1316,7 +1269,6 @@
   }
   function setInCallFlag() { try { document.body.classList.toggle("in-call", !!S.call); } catch (e) {} }
 
-  /* ---------------- PeerJS mesh ---------------- */
   let peer = null, peerOpen = false, peerError = false;
   function getPeer() {
     if (typeof window.Peer === "undefined") {
@@ -1330,8 +1282,6 @@
     peerError = false;
     peer = new window.Peer(S.user.id, { debug: 1 });
     peer.on("open", () => { peerOpen = true; tryMesh(); ensureShareMesh(); });
-    // The signalling socket drops whenever a tab sleeps — reconnect instead of
-    // staying silently deaf for the rest of the call.
     peer.on("disconnected", () => { if (S.call) { try { peer.reconnect(); } catch (e) {} } });
     peer.on("close", () => { peerOpen = false; });
     peer.on("error", e => { peerError = true; if (e && e.type === "unavailable-id") console.warn("peer id conflict", e); });
@@ -1342,7 +1292,6 @@
     const c = S.call;
     if (!c || !c.stream || !peerOpen) return;
     const roster = (guilds()[c.guildId] || {}).call || [];
-    // Lower-id side initiates so we never double-dial the same pair.
     roster.forEach(id => { if (id !== S.user.id && S.user.id < id) callUser(id); });
   }
   function callUser(uid) {
@@ -1363,19 +1312,25 @@
     const kind = mc.metadata && mc.metadata.kind ? mc.metadata.kind : "";
     const roster = (guilds()[c.guildId] || {}).roster || {};
     const haveMain = !!(c.peers[uid] && c.peers[uid].open);
-    // Sound-board clips arrive on their own media connection and must be routed
-    // before the screen-share heuristic, otherwise a clip played by someone who
-    // is sharing their screen would be mistaken for the share stream.
     if (kind === "sound") {
       try { mc.answer(); } catch (e) {}
       if (soundWait[uid]) { clearTimeout(soundWait[uid]); delete soundWait[uid]; }
       const audio = document.createElement("audio");
       audio.autoplay = true;
       audio.playsInline = true;
+      audio.style.display = "none";
+      // FIX: Appending the dynamic remote audio element to the document fixes 
+      // browsers (like Safari) immediately suspending background / detached audio playback.
+      document.body.appendChild(audio); 
       audio.srcObject = null;
       c.soundRemote.push(audio);
       mc.on("stream", s => { audio.srcObject = s; playMedia(audio); });
-      const remove = () => { const i = c.soundRemote.indexOf(audio); if (i !== -1) c.soundRemote.splice(i, 1); try { audio.pause(); audio.srcObject = null; } catch (e) {} };
+      const remove = () => { 
+        const i = c.soundRemote.indexOf(audio); 
+        if (i !== -1) c.soundRemote.splice(i, 1); 
+        try { audio.pause(); audio.srcObject = null; } catch (e) {} 
+        try { audio.remove(); } catch (e) {} 
+      };
       mc.on("close", remove);
       mc.on("error", remove);
       return;
@@ -1426,8 +1381,6 @@
     pruneIfGone(uid);
     updateStage();
   }
-  /* Presence can lag behind the media connection: once a peer's connection has
-     closed and the shared roster no longer lists them, drop them locally too. */
   function pruneIfGone(uid) {
     const c = S.call;
     if (!c || !uid || uid === S.user.id) return;
@@ -1460,8 +1413,6 @@
     });
     return dialed;
   }
-  /* Screen share rides one media connection per viewer, so re-dial whenever a
-     viewer connects or joins the call later. */
   function ensureShareMesh() {
     const c = S.call;
     if (!c || !c.share || !c.display || !peerOpen || !peer) return;
@@ -1539,6 +1490,13 @@
     if (sbBtn) sbBtn.classList.toggle("on-accent", !!SB.open);
   }
 
+  function hasLiveVideoTrack(stream) {
+    if (!stream || typeof stream.getVideoTracks !== "function") return false;
+    try {
+      return (stream.getVideoTracks() || []).some(t => t && t.readyState !== "ended");
+    } catch (e) { return false; }
+  }
+
   function updateStage() {
     const c = S.call;
     if (!c) return;
@@ -1549,17 +1507,24 @@
     const main = byId("stage-main");
     const strip = byId("stage-strip");
     if (!main) return;
+    if (c.display && !hasLiveVideoTrack(c.display)) c.display = null;
+    if (c.remoteShare && !hasLiveVideoTrack(c.remoteShare.stream)) c.remoteShare = null;
+    const liveShare =
+      (c.display && hasLiveVideoTrack(c.display)) ||
+      (c.remoteShare && c.remoteShare.stream && hasLiveVideoTrack(c.remoteShare.stream));
     const tiles = g.call.map(id => tileFor(id)).join("");
-    if (c.share || c.remoteShare) {
+    if (liveShare) {
       main.classList.remove("music");
       main.classList.add("share");
       main.innerHTML = shareTile();
       strip.hidden = false;
       strip.innerHTML = tiles;
     } else if (SP.on) {
-      main.classList.remove("music");
-      main.classList.add("share");
-      main.innerHTML = shareTile();
+      main.classList.remove("share");
+      main.classList.add("music");
+      if (!byId("sp-root")) renderMusic();
+      updateCarousel();
+      updateDock();
       strip.hidden = false;
       strip.innerHTML = tiles;
     } else {
@@ -1595,7 +1560,6 @@
     if (self) {
       body = (hasVideo ? '<video id="vm-self" autoplay playsinline muted></video>' : fill);
     } else {
-      // Separate <audio> and <video> so audio playback is never killed by hiding the video element.
       body = fill +
         '<audio id="va-' + id + '" autoplay playsinline hidden></audio>' +
         '<video id="vm-' + id + '" autoplay playsinline hidden></video>';
@@ -1643,24 +1607,20 @@
     const c = S.call;
     if (!c) return;
     const roster = (guilds()[c.guildId] || {}).roster || {};
-    // --- local self tile (muted, video only — audio plays through speakers via separate element) ---
     const tv = byId("vm-self");
     if (tv && c.stream && c.cam) {
       if (tv.srcObject !== c.stream) tv.srcObject = c.stream;
       playMedia(tv);
       tv.hidden = false;
     } else if (tv) { tv.hidden = true; tv.srcObject = null; }
-    // --- remote users: separate <audio> (va-*) and <video> (vm-*) elements ---
     Object.keys(c.remote || {}).forEach(uid => {
       const r = c.remote[uid];
       if (!r) return;
-      // Audio element — always bound when audio tracks exist, regardless of camera
       const av = byId("va-" + uid);
       if (av && r.audio) {
         if (av.srcObject !== r.stream) av.srcObject = r.stream;
         playMedia(av);
       }
-      // Video element — only bound when cam is on AND WebRTC has video track
       const el = byId("vm-" + uid);
       const camOn = roster[uid] ? !!roster[uid].cam : true;
       if (el && r.video && camOn) {
@@ -1669,15 +1629,14 @@
         el.hidden = false;
       } else if (el) {
         el.hidden = true;
-        el.srcObject = null;   // safe: audio lives on va-* element
+        el.srcObject = null;
       }
     });
-    // --- screen share ---
     const sv = byId("share-video");
     const shareStream = c.display || (c.remoteShare ? c.remoteShare.stream : null);
     if (sv && shareStream) {
       if (sv.srcObject !== shareStream) sv.srcObject = shareStream;
-      sv.muted = !!c.share;          // mute own screen-share preview (echo)
+      sv.muted = !!c.share;
       playMedia(sv);
       sv.hidden = false;
     } else if (sv) { sv.hidden = true; sv.srcObject = null; }
@@ -1691,7 +1650,7 @@
       c.hasMedia = false; c.cam = false; c.mic = false;
       updateCtl(); updateStage();
       toast("Camera/microphone are not available here. You joined with your avatar.", "info");
-      getPeer();     // still reachable: peers can send us their audio / screen share
+      getPeer();
       return;
     }
     navigator.mediaDevices.getUserMedia({ audio: true, video: false })
@@ -1712,8 +1671,6 @@
         c.hasMedia = false; c.cam = false; c.mic = false;
         updateCtl(); updateStage();
         toast("Could not access camera/microphone (" + (err && err.name ? err.name : "blocked") + "). Joining with your avatar.", "err");
-        // Without a PeerJS id nobody can call us — register anyway so we still
-        // receive the others' audio, camera and screen share.
         getPeer();
       });
   }
@@ -1767,7 +1724,6 @@
     }
   }
 
-  /* ---------- mid-call camera renegotiation (PeerJS has no auto-renegotiate) ---------- */
   function openPeers() {
     const c = S.call; if (!c) return [];
     const out = [];
@@ -1856,7 +1812,6 @@
           if (!r.stream.getAudioTracks().includes(x.track)) r.stream.addTrack(x.track);
         }
       });
-      // Prune ended tracks so stale video ever actually shows.
       r.stream.getTracks().forEach(t => { if (t.readyState === "ended") { try { r.stream.removeTrack(t); } catch (e) {} } });
     } catch (e) {}
     const changed = r.video !== hasVideo || r.audio !== hasAudio;
@@ -1888,9 +1843,7 @@
       updateStage(); updateCtl();
       c.shareWaiting = dialed === 0;
       toast(dialed ? "You are sharing your screen." : "Screen share is live for you — waiting for the other participants to connect.", dialed ? "ok" : "info");
-    } catch (err) {
-      /* user cancelled the picker */
-    }
+    } catch (err) {}
   }
 
   function stopShare(auto) {
@@ -1906,13 +1859,9 @@
     toast(auto ? "Screen share ended." : "You stopped sharing.", "info");
   }
 
-  /* ---------- talking activity rings (analysed locally, synced to peers) ----------
-     An analyser can only ever hear the local microphone, so whoever is talking
-     publishes that fact on the server channel ("talk") and every client draws
-     the same green ring around the same speaker. */
   const _watch = {};
   const talkCtxs = new Set();
-  const talkState = {};                                  // uid -> { talking, int, at }
+  const talkState = {};
   const talkSent = { state: false, at: 0, level: 0 };
   const tileEl = uid => document.querySelector('.tile[data-user-id="' + uid + '"]') || byId(uid === S.user.id ? "tile-self" : "tile-" + uid);
   function resumeTalkContexts() {
@@ -1921,8 +1870,8 @@
   function setTalkVisual(uid, talking, int) {
     const el = tileEl(uid);
     if (!el) return;
-    el.classList.toggle("talking", !!talking);    // green glowing ring on the avatar
-    el.classList.toggle("speaking", !!talking);   // tile border glow (camera-on tiles have no avatar)
+    el.classList.toggle("talking", !!talking);
+    el.classList.toggle("speaking", !!talking);
     const av = $(".tile-avatar", el);
     if (av) av.style.setProperty("--talk-int", String(Math.max(0, Math.min(1, int || 0))));
   }
@@ -1936,15 +1885,13 @@
     if (uid) { delete talkState[uid]; setTalkVisual(uid, false, 0); return; }
     Object.keys(talkState).forEach(k => { delete talkState[k]; setTalkVisual(k, false, 0); });
   }
-  /* Publish our own speaking state (throttled: ~8 updates/second while talking,
-     one final update when we stop). */
   function broadcastTalk(level) {
     const c = S.call;
     if (!c || !S.user || !supabaseClient) return;
     const talking = level > 0.3;
     const now = Date.now();
     if (talking === talkSent.state) {
-      if (!talking) return;                                  // already reported "stopped"
+      if (!talking) return;
       if (now - talkSent.at < 120) return;
       if (Math.abs(level - talkSent.level) < 0.04 && now - talkSent.at < 500) return;
     }
@@ -1981,9 +1928,6 @@
     } catch (e) { return; }
     const resume = () => { if (ctx && ctx.state === "suspended") { try { ctx.resume(); } catch (e) {} } };
     talkCtxs.add(ctx);
-    // A fresh AudioContext starts suspended until the page has user activation,
-    // which would leave the analyser reading silence — resume it eagerly and on
-    // every later gesture (see the boot-time listeners).
     resume();
     resumeTalkContexts();
     const buf = new Float32Array(analyser.fftSize);
@@ -2002,8 +1946,6 @@
       if (typeof onLevel === "function") {
         onLevel(watcher.int);
       } else {
-        // The speaker's own "talk" broadcast is authoritative; this local
-        // analyser is only a fallback for peers that stopped reporting.
         const t = talkState[uid];
         if (!t || Date.now() - t.at > 1500) setTalkVisual(uid, watcher.talking, watcher.int);
       }
@@ -2043,12 +1985,9 @@
     } catch (e) { return null; }
   }
   function sbStopAllLocal() { _sbAudio.forEach(a => { try { a.pause(); a.src = ""; } catch (e) {} }); _sbAudio.length = 0; }
-  const soundWait = {};          // player id -> timer waiting for their WebRTC clip
+  const soundWait = {};
   function sbBroadcast(s) {
     if (!S.call || !s || !supabaseClient) return;
-    // Stream the clip into the WebRTC audio graph for everyone in the call and
-    // announce it on the channel; listeners only fall back to playing the data
-    // URL themselves when that media connection never shows up.
     const rtc = playSoundboardToCall(s.dataUrl);
     const ch = getChannel(S.call.guildId);
     if (ch) {
@@ -2062,8 +2001,6 @@
     if (!S.call || !p) return;
     if (p.player && p.player === S.user.id) return;
     if (p.rtc && p.dataUrl) {
-      // The player is pushing the clip over WebRTC — wait for that stream so the
-      // clip is not heard twice, and fall back to the data URL if it never lands.
       if (soundWait[p.player]) clearTimeout(soundWait[p.player]);
       soundWait[p.player] = setTimeout(() => {
         delete soundWait[p.player];
@@ -2097,8 +2034,6 @@
         if (i !== -1) c.soundLocal.splice(i, 1);
         try { audio.pause(); audio.src = ""; } catch (e) {}
         try { ctx.close(); } catch (e) {}
-        // The clip is over: close the per-peer connections instead of leaking
-        // one media connection per sound until we leave the call.
         c.soundMc = (c.soundMc || []).filter(mc => calls.indexOf(mc) === -1);
         calls.splice(0).forEach(mc => { try { mc.close(); } catch (e) {} });
       };
@@ -2115,8 +2050,6 @@
         } catch (e) {}
       });
       c.soundMc.push(...calls);
-      // A suspended context is silent for us *and* for the peers (they receive
-      // this context's output stream), so nudge it awake.
       if (ctx.state === "suspended") { try { const pr = ctx.resume(); if (pr && pr.catch) pr.catch(() => {}); } catch (e) {} }
       audio.play().catch(() => {});
       return calls.length > 0;
@@ -2425,7 +2358,6 @@
         if (name.length < 2) return toast("Display name needs 2+ characters.", "err");
         S.user = { id: S.user.id, name, color: chosen };
         DB.profiles[S.user.id] = { id: S.user.id, name, color: chosen };
-        // Names/colors live in auth user_metadata (given schema has no name columns).
         if (supabaseClient) {
           supabaseClient.auth.updateUser({ data: { display_name: name, color: chosen } }).then(() => {}).catch(() => {});
           pushPresence();
@@ -2527,13 +2459,8 @@
     "https://api.piped.private.coffee"
   ];
 
-  /* -------- Resolver health cache --------
-     When Invidious/Piped go down (which they are most of the time on some
-     networks), we remember it in localStorage so the very next track skips
-     the whole resolver chain and goes straight to the YouTube IFrame player.
-     The cache expires after COOLDOWN_MS so we periodically re-probe. */
   const RESOLVER_CACHE_KEY = "hc_resolver_down_until";
-  const RESOLVER_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+  const RESOLVER_COOLDOWN_MS = 30 * 60 * 1000;
 
   function isResolverKnownDown() {
     try {
@@ -2627,11 +2554,13 @@
     return out.slice(0, 6);
   }
 
-  /* ---------- YouTube IFrame player ---------- */
   let ytPlayer = null;
   let ytPlayerReady = false;
   let ytApiPromise = null;
   let ytReadyTimer = null;
+  let ytLoadedId = null;
+  const ytFailMemory = {};
+  const YT_RETRY_COOLDOWN_MS = 60 * 1000;
 
   function loadYouTubeIframeAPI() {
     if (window.YT && window.YT.Player) return Promise.resolve();
@@ -2653,12 +2582,22 @@
   }
 
   async function playViaYouTubeIframe(ytId, autoplay) {
+    if (ytPlayer && ytPlayerReady && ytLoadedId === ytId) {
+      if (autoplay) { try { ytPlayer.playVideo(); } catch(e){} }
+      else { try { ytPlayer.pauseVideo(); } catch(e){} }
+      return true;
+    }
+    if (Date.now() - (ytFailMemory[ytId] || 0) < YT_RETRY_COOLDOWN_MS) {
+      logPlayer("warn", "YouTube IFrame for " + ytId + " failed recently — skipping reload.");
+      return false;
+    }
     try { await loadYouTubeIframeAPI(); }
     catch (e) { logPlayer("error", "Failed to load YouTube IFrame API: " + e.message); return false; }
 
     const host = document.getElementById("yt-host");
     if (!host) { logPlayer("error", "yt-host container missing"); return false; }
     if (ytPlayer && ytPlayer.destroy) { try { ytPlayer.destroy(); } catch(e){} ytPlayer = null; }
+    ytLoadedId = null;
     ytPlayerReady = false;
     if (ytReadyTimer) { clearTimeout(ytReadyTimer); ytReadyTimer = null; }
     host.innerHTML = '<div id="yt-target"></div>';
@@ -2676,6 +2615,7 @@
           events: {
             onReady: (e) => {
               ytPlayerReady = true;
+              ytLoadedId = ytId;
               if (ytReadyTimer) { clearTimeout(ytReadyTimer); ytReadyTimer = null; }
               try { e.target.setVolume(Math.round(SP.volume * 100)); } catch(err){}
               if (autoplay) { try { e.target.playVideo(); } catch(err){} }
@@ -2683,7 +2623,6 @@
               done(true);
             },
             onStateChange: (e) => {
-              // 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
               if (e.data === 0 && SP.on) nextTrack({ auto: true });
               if (e.data === 1) { SP.playing = true; updateDock(); }
               if (e.data === 2) { SP.playing = false; updateDock(); }
@@ -2707,12 +2646,12 @@
     if (ytReadyTimer) { clearTimeout(ytReadyTimer); ytReadyTimer = null; }
     if (ytPlayer && ytPlayer.destroy) { try { ytPlayer.destroy(); } catch(e){} }
     ytPlayer = null;
+    ytLoadedId = null;
     ytPlayerReady = false;
     const host = document.getElementById("yt-host");
     if (host) host.innerHTML = "";
   }
 
-  /* ---------- HTML5 <audio> engine ---------- */
   let audioEl = null;
   let audioReady = false;
   let audioTrackId = null;
@@ -2806,7 +2745,6 @@
   function pauseAudio() { if (audioEl) { try { audioEl.pause(); } catch (e) {} } }
   function seekAudio(sec) { if (audioEl && sec != null) { try { audioEl.currentTime = sec; } catch (e) {} } }
 
-  /* ---------- SoundCloud ---------- */
   let scWidget = null;
   let scWidgetReady = false;
   let scBaseUrl = "";
@@ -2877,7 +2815,6 @@
     scBaseUrl = "";
   }
 
-  /* ---------- core playback controller ---------- */
   function curTrack() { return SP.queue[SP.index] || null; }
   function ensureHost() {
     if (!S.user) return;
@@ -2895,7 +2832,6 @@
     return "";
   }
 
-  /* ---------- session sync ---------- */
   function syncSpotify() { if (S.call) pushMusic(); }
   function applySpotifySync(p) {
     if (!p || typeof p !== "object" || !SP.on || !S.call) return;
@@ -2912,37 +2848,46 @@
     if (t) {
       if (t.source === "audio" && t.url) playAudioTrack(t, SP.playing);
       else if (t.source === "sc" && t.scUrl) loadSoundCloudTrack(t, SP.playing);
-      else if (t.source === "ytiframe" && t.ytId) playViaYouTubeIframe(t.ytId, SP.playing);
+      else if (t.source === "ytiframe" && t.ytId) {
+        if (ytPlayer && ytPlayerReady && ytLoadedId === t.ytId) {
+          if (SP.playing) { try { ytPlayer.playVideo(); } catch(e){} }
+          else { try { ytPlayer.pauseVideo(); } catch(e){} }
+        } else {
+          playViaYouTubeIframe(t.ytId, SP.playing);
+        }
+      }
       else if (t.ytId) loadYouTubeTrack(t.ytId, SP.playing);
     }
     if (S.call) { updateCarousel(); updateDynamicBackground(t); updateDock(); }
   }
 
-  /* ---------- THE MAIN PLAYBACK FUNCTION with fast-path ---------- */
   async function loadYouTubeTrack(ytId, autoPlay = true) {
     if (!ytId || !SP.on) return;
     if (autoPlay) SP.playing = true;
     const t = curTrack();
 
-    // Already playing via <audio> — resume immediately
     if (t && t.ytId === ytId && t.source === "audio" && t.url) {
       playAudioTrack(t, autoPlay);
       return;
     }
 
-    // Already on IFrame for this track — just play/pause
-    if (t && t.ytId === ytId && t.source === "ytiframe" && ytPlayer && ytPlayerReady) {
+    if (t && t.ytId === ytId && t.source === "ytiframe" && ytPlayer && ytPlayerReady && ytLoadedId === ytId) {
       if (autoPlay) { try { ytPlayer.playVideo(); } catch(e){} }
       else { try { ytPlayer.pauseVideo(); } catch(e){} }
       return;
     }
 
-    // ---- FAST PATH: resolvers were down recently → go straight to IFrame ----
+    if (Date.now() - (ytFailMemory[ytId] || 0) < YT_RETRY_COOLDOWN_MS) {
+      logPlayer("warn", "Skipping " + ytId + " — embed failed recently (retry cooldown).");
+      return;
+    }
+
     if (isResolverKnownDown()) {
       logPlayer("info", "Resolvers marked down — using YouTube IFrame directly for " + ytId);
       if (t && t.ytId === ytId) { t.source = "ytiframe"; t.url = null; t.audUrls = null; }
       const ok = await playViaYouTubeIframe(ytId, autoPlay);
       if (!ok) {
+        ytFailMemory[ytId] = Date.now();
         logPlayer("error", "YouTube IFrame failed for " + ytId + " — skipping.");
         toast("This video can't be embedded — skipping.", "err");
         if (SP.on && curTrack() && curTrack().ytId === ytId) nextTrack({ auto: true });
@@ -2950,7 +2895,6 @@
       return;
     }
 
-    // ---- SLOW PATH: try resolvers with a tight timeout ----
     logPlayer("info", "Resolving audio stream for " + ytId + "…");
     toast("Resolving audio stream…", "info");
 
@@ -2969,7 +2913,6 @@
       return;
     }
 
-    // ---- FAILURE: mark resolvers down for 30 min, use IFrame ----
     markResolverDown();
     logPlayer("warn", "Resolvers unreachable — cached for 30 min. Using YouTube IFrame for " + ytId);
     toast("Resolvers down — using YouTube player.", "info");
@@ -2977,6 +2920,7 @@
     if (t && t.ytId === ytId) { t.source = "ytiframe"; t.url = null; t.audUrls = null; }
     const ok = await playViaYouTubeIframe(ytId, autoPlay);
     if (!ok) {
+      ytFailMemory[ytId] = Date.now();
       logPlayer("error", "YouTube IFrame failed for " + ytId + " (embed denied or network). Skipping.");
       toast("This video can't be embedded — skipping.", "err");
       if (SP.on && curTrack() && curTrack().ytId === ytId) nextTrack({ auto: true });
@@ -2985,7 +2929,6 @@
     }
   }
 
-  /* ---------- playback controls ---------- */
   function setTrack(ni, opts) {
     opts = opts || {};
     if (!SP.queue.length || !SP.on) return;
@@ -3109,7 +3052,6 @@
     refreshProgress();
   }
 
-  /* ---------- dynamic background ---------- */
   function updateDynamicBackground(t, immediate) {
     const bgA = byId("sp-bg-a"), bgB = byId("sp-bg-b");
     if (!bgA || !bgB) return;
@@ -3129,7 +3071,6 @@
     }, 800);
   }
 
-  /* ---------- music UI ---------- */
   function renderMusic() {
     const main = byId("stage-main");
     if (!main) return;
@@ -3141,592 +3082,4 @@
           '<div class="sp-bg-layer a" id="sp-bg-a"></div>' +
           '<div class="sp-bg-layer b" id="sp-bg-b"></div>' +
         '</div>' +
-        '<div class="sp-top-bar" id="sp-top-bar">' +
-          '<div class="sp-search-bar" id="sp-search-bar">' +
-            '<span class="sp-search-icon">' + ic("search", 16) + '</span>' +
-            '<input type="text" id="sp-stage-search-in" placeholder="Search YouTube songs, artists, or paste a YouTube / SoundCloud link..." autocomplete="off" />' +
-            '<button class="sp-search-btn" id="sp-stage-search-btn" title="Search YouTube">Search</button>' +
-            '<button class="sp-key-btn" id="sp-key-btn" title="YouTube Data API v3 Key (optional)">' + ic("gear", 15) + '</button>' +
-          '</div>' +
-        '</div>' +
-        '<div class="sp-carousel" id="sp-carousel"><div class="sp-lane" id="sp-lane">' +
-          [-2, -1, 0, 1, 2].map(o => '<div class="sp-card" data-o="' + o + '"><div class="sp-card-art"></div><div class="sp-card-meta"><div class="sp-card-title"></div><div class="sp-card-artist"></div></div></div>').join("") +
-        "</div></div>" +
-        '<div class="sp-dock-wrap">' +
-          '<div class="sp-dock" id="sp-dock">' +
-            '<div class="sp-dock-left">' +
-              '<button class="sp-icon-btn" id="sp-prev" title="Previous track">' + ic("spPrev", 20) + "</button>" +
-              '<button class="sp-icon-btn sp-btn-play" id="sp-play" title="Play / Pause">' + ic(SP.playing ? "spPause" : "spPlay", 22) + "</button>" +
-              '<button class="sp-icon-btn" id="sp-next" title="Next track">' + ic("spNext", 20) + "</button>" +
-            "</div>" +
-            '<div class="sp-mini" id="sp-mini">' +
-              '<div class="sp-mini-art" id="sp-mini-art">' +
-                '<div class="sp-mini-prog"><div class="sp-mini-prog-fill" id="sp-prog-fill"></div></div>' +
-              "</div>" +
-              '<div class="sp-mini-info">' +
-                '<div class="sp-mini-title" id="sp-mini-title">Nothing queued</div>' +
-                '<div class="sp-mini-artist" id="sp-mini-artist">Search a track to begin</div>' +
-              "</div>" +
-              '<div class="sp-mini-eq ' + (SP.playing ? "playing" : "") + '" id="sp-mini-eq" title="Audio equalizer">' +
-                "<span></span><span></span><span></span><span></span>" +
-              "</div>" +
-              '<button class="sp-icon-btn sp-mini-more" id="sp-mini-more" title="Track options">' + ic("ellipsis", 18) + "</button>" +
-            "</div>" +
-            '<div class="sp-dock-right">' +
-              (hosting ? '<button class="sp-icon-btn ' + (SP.restrict ? "on" : "") + '" id="sp-restrict" title="' + (SP.restrict ? "Only host can control (click to unlock)" : "Anyone can control (click to lock)") + '">' + ic(SP.restrict ? "lock" : "unlock", 16) + "</button>" : "") +
-              '<button class="sp-icon-btn ' + (SP.openPanel === "lyrics" ? "active" : "") + '" id="sp-lyrics" title="Lyrics">' + ic("spLyrics", 20) + "</button>" +
-              '<button class="sp-icon-btn ' + (SP.openPanel === "queue" ? "active" : "") + '" id="sp-queue-btn" title="Queue & YouTube Search">' + ic("spQueue", 20) + "</button>" +
-              '<button class="sp-icon-btn ' + (SP.openPanel === "logs" ? "active" : "") + '" id="sp-logs-btn" title="Playback Logs">' + ic("spLogs", 20) + "</button>" +
-              '<div class="sp-vol-wrap">' +
-                '<button class="sp-icon-btn" id="sp-vol-btn" title="Volume">' + ic("spVolume", 20) + "</button>" +
-                '<div class="sp-vol-pop"><input id="sp-vol" type="range" min="0" max="1" step="0.02" value="' + SP.volume + '"></div>' +
-              "</div>" +
-            "</div>" +
-          "</div>" +
-        "</div>" +
-        '<div class="sp-panel" id="sp-panel-queue"></div>' +
-        '<div class="sp-panel" id="sp-panel-lyrics"></div>' +
-        '<div class="sp-panel" id="sp-panel-logs"></div>' +
-      "</div>";
-    wireMusic();
-    updateCarousel();
-    updateDynamicBackground(curTrack(), true);
-    updateDock();
-    refreshPanels();
-  }
-
-  function wireMusic() {
-    const hid = (id, fn) => { const el = byId(id); if (el) el.addEventListener("click", fn); };
-    hid("sp-prev", () => prevTrack());
-    hid("sp-play", () => togglePlay());
-    hid("sp-next", () => nextTrack({}));
-    hid("sp-lyrics", () => togglePanel("lyrics"));
-    hid("sp-queue-btn", () => togglePanel("queue"));
-    hid("sp-logs-btn", () => togglePanel("logs"));
-    hid("sp-restrict", toggleRestrict);
-    hid("sp-mini-more", () => { const t = curTrack(); if (t) toast(t.title + " by " + t.artist, "info"); });
-    const vol = byId("sp-vol");
-    if (vol) vol.addEventListener("input", () => {
-      SP.volume = Math.max(0, Math.min(1, parseFloat(vol.value) || 0));
-      if (audioEl) { try { audioEl.volume = SP.volume; } catch(e){} }
-      if (ytPlayer && ytPlayerReady) { try { ytPlayer.setVolume(Math.round(SP.volume * 100)); } catch(e){} }
-      syncSpotify();
-    });
-
-    const sIn = byId("sp-stage-search-in");
-    const sBtn = byId("sp-stage-search-btn");
-    const openWithQuery = q => {
-      SP.openPanel = "queue";
-      SP.panelTab = "search";
-      refreshPanels();
-      updateDock();
-      if (q && q.trim()) {
-        const panelIn = byId("sp-search-in");
-        if (panelIn) { panelIn.value = q.trim(); const panelGo = byId("sp-search-go"); if (panelGo) panelGo.click(); }
-      }
-    };
-    if (sBtn) sBtn.addEventListener("click", () => openWithQuery(sIn ? sIn.value : ""));
-    if (sIn) sIn.addEventListener("keydown", e => { if (e.key === "Enter") openWithQuery(sIn.value); });
-    hid("sp-key-btn", () => ytApiKeyModal());
-  }
-
-  function updateCarousel() {
-    const lan = byId("sp-lane");
-    if (!lan) return;
-    const cards = lan.children || [];
-    for (let i = 0; i < cards.length; i++) {
-      const o = i - 2;
-      const card = cards[i];
-      if (!card) continue;
-      const ti = SP.index + o;
-      const t = SP.queue[ti];
-      card.dataset.o = o;
-      card.classList.toggle("active", o === 0);
-      card.classList.toggle("clickable", !!(o && t));
-      if (o && t) card.onclick = () => slideTo(o); else card.onclick = null;
-      if (t) {
-        card.style.display = "";
-        const art = card.querySelector(".sp-card-art");
-        if (art) {
-          if (t.source === "sc" && o === 0) {
-            art.style.backgroundImage = "";
-            const src = soundcloudEmbedUrl(t, SP.playing);
-            let scEmbed = art.querySelector("iframe.sp-sc-embed");
-            if (!scEmbed) {
-              art.innerHTML = '<iframe class="sp-sc-embed" src="' + src + '" width="100%" height="100%" frameborder="no" scrolling="no" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen title="SoundCloud player"></iframe>';
-            } else if (scEmbed.getAttribute("src") !== src) {
-              scEmbed.setAttribute("src", src);
-            }
-          } else {
-            art.style.backgroundImage = artCSS(t);
-            const scEmbed = art.querySelector("iframe.sp-sc-embed");
-            if (scEmbed) scEmbed.remove();
-          }
-        }
-        const tt = card.querySelector(".sp-card-title");
-        if (tt) tt.textContent = t.title;
-        const at = card.querySelector(".sp-card-artist");
-        if (at) at.textContent = t.artist;
-      } else {
-        card.style.display = "none";
-      }
-    }
-  }
-
-  function updateDock() {
-    const play = byId("sp-play");
-    if (play) play.innerHTML = ic(SP.playing ? "spPause" : "spPlay", 22);
-    const can = canControl();
-    [byId("sp-prev"), byId("sp-next"), play].forEach(el => { if (el) el.disabled = !can; });
-    const rst = byId("sp-restrict");
-    if (rst) rst.classList.toggle("on", !!SP.restrict);
-    const vol = byId("sp-vol"); if (vol) vol.value = String(SP.volume);
-    const t = curTrack();
-    const ma = byId("sp-mini-art");
-    if (ma) {
-      const artUrl = t ? (t.thumbUrl || t.artUrl) : "";
-      ma.style.backgroundImage = artUrl ? 'url("' + artUrl + '")' : (t ? artCSS(t) : "");
-    }
-    const mt = byId("sp-mini-title"), ms = byId("sp-mini-artist");
-    if (mt) mt.textContent = t ? t.title : "Nothing queued";
-    if (ms) ms.textContent = t ? t.artist : "Select a track";
-    const eq = byId("sp-mini-eq");
-    if (eq) eq.classList.toggle("playing", !!SP.playing);
-    const lyr = byId("sp-lyrics");
-    if (lyr) lyr.classList.toggle("active", SP.openPanel === "lyrics");
-    const qbtn = byId("sp-queue-btn");
-    if (qbtn) qbtn.classList.toggle("active", SP.openPanel === "queue");
-    const lgbtn = byId("sp-logs-btn");
-    if (lgbtn) lgbtn.classList.toggle("active", SP.openPanel === "logs");
-    refreshProgress();
-  }
-
-  function refreshProgress() {
-    const t = curTrack();
-    const dur = (t && t.dur) ? t.dur : 200000;
-    const pb = byId("sp-prog-fill");
-    if (pb) pb.style.width = (dur ? Math.min(100, (SP.pos / dur) * 100) : 0) + "%";
-  }
-
-  function decodeHTMLEntities(str) {
-    if (!str) return "";
-    const p = document.createElement("textarea");
-    p.innerHTML = str;
-    return p.value;
-  }
-
-  function getYtApiKey() { return localStorage.getItem("hc_yt_api_key") || ""; }
-  function setYtApiKey(k) {
-    if (k && k.trim()) localStorage.setItem("hc_yt_api_key", k.trim());
-    else localStorage.removeItem("hc_yt_api_key");
-  }
-
-  function ytApiKeyModal() {
-    const current = getYtApiKey();
-    showModal(
-      '<h2>YouTube Data API v3 Key</h2>' +
-      '<p class="sub">Optional: enter a YouTube Data API v3 key to search embeddable videos from YouTube\'s official index.</p>' +
-      '<div class="f-group" style="margin-top:16px;">' +
-        '<label class="f-label">API Key</label>' +
-        '<input type="text" class="f-input" id="yt-key-in" placeholder="AIzaSy..." value="' + esc(current) + '" style="width:100%;background:var(--bg-2);border:1px solid var(--line-2);color:var(--tx);border-radius:8px;padding:10px 12px;outline:none;" />' +
-      '</div>' +
-      '<div style="font-size:12px;color:var(--tx-3);margin:12px 0 16px;line-height:1.5;">Leave blank to use the public Invidious / Piped search, with automatic YouTube IFrame fallback.</div>' +
-      '<div class="modal-acts" style="display:flex;gap:8px;justify-content:flex-end;">' +
-        (current ? '<button class="btn btn-ghost btn-sm" id="yt-key-clear">Clear Key</button>' : '') +
-        '<button class="btn btn-primary btn-sm" id="yt-key-save">Save</button>' +
-      '</div>'
-    );
-    const saveBtn = byId("yt-key-save");
-    if (saveBtn) saveBtn.addEventListener("click", () => {
-      setYtApiKey((byId("yt-key-in").value || "").trim());
-      closeModal();
-      toast("Saved.", "ok");
-    });
-    const clrBtn = byId("yt-key-clear");
-    if (clrBtn) clrBtn.addEventListener("click", () => { setYtApiKey(""); closeModal(); toast("Cleared.", "info"); });
-  }
-
-  function extractYouTubeId(url) {
-    if (!url) return null;
-    const str = url.trim();
-    if (/^[\w-]{11}$/.test(str)) return str;
-    const m = str.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})/i);
-    return m ? m[1] : null;
-  }
-
-  async function searchYouTube(query) {
-    query = (query || "").trim();
-    if (!query) return [];
-    const term = query + " Audio";
-    const directId = extractYouTubeId(query);
-    if (directId) {
-      let title = "YouTube Video", artist = "YouTube Audio";
-      try {
-        const nr = await fetch("https://noembed.com/embed?url=https://www.youtube.com/watch?v=" + directId);
-        const nj = await nr.json();
-        if (nj.title) title = nj.title;
-        if (nj.author_name) artist = nj.author_name;
-      } catch (e) {}
-      return [{
-        id: "yt_" + directId, ytId: directId, title, artist, album: "YouTube", dur: 210000,
-        artUrl: "https://img.youtube.com/vi/" + directId + "/hqdefault.jpg",
-        thumbUrl: "https://img.youtube.com/vi/" + directId + "/mqdefault.jpg"
-      }];
-    }
-
-    let results = null;
-    const apiKey = getYtApiKey();
-    if (apiKey) {
-      try {
-        const url = "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&videoSyndicated=true&maxResults=12&q=" + encodeURIComponent(term) + "&key=" + apiKey;
-        const res = await fetch(url);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.items && data.items.length) {
-            results = data.items.map(item => {
-              const vid = item.id && item.id.videoId;
-              if (!vid) return null;
-              const snip = item.snippet || {};
-              const highThumb = snip.thumbnails && snip.thumbnails.high ? snip.thumbnails.high.url : ("https://img.youtube.com/vi/" + vid + "/hqdefault.jpg");
-              const medThumb = snip.thumbnails && snip.thumbnails.medium ? snip.thumbnails.medium.url : ("https://img.youtube.com/vi/" + vid + "/mqdefault.jpg");
-              return {
-                id: "yt_" + vid, ytId: vid,
-                title: decodeHTMLEntities(snip.title || "Unknown Title"),
-                artist: decodeHTMLEntities(snip.channelTitle || "YouTube"),
-                album: "YouTube", dur: 210000, artUrl: highThumb, thumbUrl: medThumb
-              };
-            }).filter(Boolean);
-          }
-        }
-      } catch (e) {}
-    }
-
-    if (!results || !results.length) {
-      const endpoints = INVIDIOUS_INSTANCES.map(base => base + "/api/v1/search?q=" + encodeURIComponent(term) + "&type=video")
-        .concat(PIPED_INSTANCES.map(base => base + "/search?q=" + encodeURIComponent(term) + "&filter=videos"));
-      for (const ep of endpoints) {
-        try {
-          const ctrl = new AbortController();
-          const tid = setTimeout(() => ctrl.abort(), 3500);
-          const res = await fetch(ep, { signal: ctrl.signal });
-          clearTimeout(tid);
-          if (res.ok) {
-            const j = await res.json();
-            const list = Array.isArray(j) ? j : (j.items || []);
-            if (list && list.length) {
-              results = list.slice(0, 10).map(item => {
-                const vid = item.videoId || (item.url ? extractYouTubeId(item.url) : null);
-                if (!vid) return null;
-                const title = item.title || "Unknown Title";
-                if (/VEVO/i.test(title)) return null;
-                const author = item.author || item.uploaderName || "YouTube";
-                const thumb = item.videoThumbnails ? ((item.videoThumbnails.find(x => x.quality === "high") || {}).url || ("https://img.youtube.com/vi/" + vid + "/hqdefault.jpg")) : ("https://img.youtube.com/vi/" + vid + "/hqdefault.jpg");
-                return {
-                  id: "yt_" + vid, ytId: vid, title, artist: author, album: "YouTube",
-                  dur: (item.lengthSeconds ? item.lengthSeconds * 1000 : 210000),
-                  artUrl: thumb, thumbUrl: "https://img.youtube.com/vi/" + vid + "/mqdefault.jpg"
-                };
-              }).filter(Boolean);
-            }
-          }
-        } catch (e) {}
-        if (results && results.length) break;
-      }
-    }
-
-    return results && results.length ? results : [];
-  }
-
-  const AUDIO_EXT_RE = /\.(mp3|aac|wav|m4a|flac|ogg|oga|opus|aiff|webm)([?#].*)?$/i;
-  function detectDirectAudio(input) {
-    const raw = (input || "").trim();
-    if (!/^https?:\/\//i.test(raw)) return false;
-    if (extractYouTubeId(raw)) return false;
-    return AUDIO_EXT_RE.test(raw);
-  }
-  function buildAudioTrack(url) {
-    const raw = (url || "").trim();
-    const fname = decodeURIComponent(((raw.split("?")[0] || "").split("#")[0] || "").split("/").pop()) || "";
-    const title = fname.replace(/\.(mp3|aac|wav|m4a|flac|ogg|oga|opus|aiff|webm)$/i, "").replace(/[-_+]+/g, " ").replace(/\s+/g, " ").trim() || "Direct Stream";
-    return {
-      id: "au_" + Math.random().toString(36).slice(2, 10),
-      source: "audio", url: raw, title, artist: "Direct Audio", album: "Stream", dur: 0,
-      artUrl: "", thumbUrl: "", embeddable: true
-    };
-  }
-  function parseSoundCloudUrl(input) {
-    const raw = (input || "").trim();
-    if (!raw) return null;
-    let m = raw.match(/^https?:\/\/(?:www\.|app\.|m\.|api\.)?soundcloud\.com\/([^\/?#]+)\/(?:sets\/)?([^\/?#]+)/i);
-    if (m) {
-      const artist = decodeURIComponent(m[1].trim());
-      if (/^(search|people|you|popular|charts|stream|upload|settings|discover|creators|signin|forgot-password|notifications|messages)$/i.test(artist)) return null;
-      let slug = m[2].trim();
-      if (/^https?:\/\//i.test(slug)) return null;
-      return { artist, slug: decodeURIComponent(slug.replace(/\/+$/, "")), url: raw.replace(/[?#].*$/, "").replace(/\/$/, ""), type: /\/sets\//i.test(raw) ? "set" : "track" };
-    }
-    return null;
-  }
-  const humanizeSlug = s => (s || "").replace(/[-_+]+/g, " ").replace(/\b\w/g, c => c.toUpperCase()).trim();
-  async function resolveSoundCloudUrl(inputUrl) {
-    const m = parseSoundCloudUrl(inputUrl);
-    if (!m) return null;
-    const track = {
-      id: "sc_" + m.artist + "_" + m.slug, source: "sc", scUrl: m.url, scType: m.type || "track",
-      title: humanizeSlug(m.slug), artist: humanizeSlug(m.artist), album: "SoundCloud",
-      dur: 210000, artUrl: "", thumbUrl: "", embeddable: true, oembedOk: false
-    };
-    try {
-      const ctrl = new AbortController();
-      const tid = setTimeout(() => ctrl.abort(), 5000);
-      const res = await fetch("https://soundcloud.com/oembed?url=" + encodeURIComponent(m.url) + "&format=json", { signal: ctrl.signal });
-      clearTimeout(tid);
-      if (res.ok) {
-        const o = await res.json();
-        if (o.title) track.title = o.title;
-        if (o.author_name) track.artist = o.author_name;
-        if (o.thumbnail_url) {
-          track.thumbUrl = o.thumbnail_url;
-          const hi = o.thumbnail_url.replace(/-(?:t\d+x\d+|large|small|crop)\.jpg$/i, "-t500x500.jpg");
-          track.artUrl = /\.jpg$/i.test(hi) ? hi : o.thumbnail_url;
-        }
-        track.oembedOk = true;
-      }
-    } catch (e) {}
-    return track;
-  }
-
-  function queuePanelHTML() {
-    const tab = SP.panelTab || "search";
-    let h = '<div class="tabs-inline" style="margin-bottom:12px;">' +
-      '<button class="tab-inline ' + (tab === "search" ? "active" : "") + '" data-qtab="search">Search</button>' +
-      '<button class="tab-inline ' + (tab === "queue" ? "active" : "") + '" data-qtab="queue">Up Next (' + SP.queue.length + ')</button>' +
-      '</div>';
-    if (tab === "search") {
-      h += '<div style="display:flex;gap:8px;margin-bottom:10px;">' +
-        '<input id="sp-search-in" type="text" placeholder="Search songs, artists, or paste a YouTube / SoundCloud link..." style="flex:1;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.18);border-radius:10px;padding:8px 12px;color:#fff;font-size:13px;outline:none;" />' +
-        '<button class="btn btn-primary btn-sm" id="sp-search-go" style="padding:0 14px;">' + ic("search", 15) + ' Search</button>' +
-      '</div>';
-      h += '<div class="sp-chips">' +
-        '<span class="sp-chip" data-qchip="Lofi Hip Hop Beats">☕ Lofi Beats</span>' +
-        '<span class="sp-chip" data-qchip="Synthwave Chill">🌆 Synthwave</span>' +
-        '<span class="sp-chip" data-qchip="Pop Hits">✨ Pop Hits</span>' +
-      '</div>';
-      h += '<div id="sp-search-results"><div style="text-align:center;padding:24px 12px;color:var(--tx-3);font-size:12.5px;">Type a song title, choose a suggestion chip, or paste a YouTube link.</div></div>';
-    } else {
-      h += '<div class="sp-ph"><span>Up Next Queue</span><span class="sp-ph-sub">' + SP.queue.length + ' tracks</span></div>';
-      h += '<div style="display:flex;flex-direction:column;gap:5px;margin-top:8px;">';
-      SP.queue.forEach((t, i) => {
-        const art = t.thumbUrl || t.artUrl;
-        h += '<div class="sp-qrow ' + (i === SP.index ? 'now' : '') + '">' +
-          '<div class="sp-qart" style="background-image:' + (art ? 'url(\'' + art + '\')' : artCSS(t)) + '"></div>' +
-          '<div class="sp-qti"><div class="sp-qtt">' + esc(t.title) + '</div><div class="sp-qta">' + esc(t.artist) + '</div></div>' +
-          (i === SP.index ? '<span class="sp-qnow" title="Playing now">' + ic("volume", 15) + '</span>' : (canControl() ? '<button class="sp-qx" data-rm="' + i + '" title="Remove from queue">' + ic("x", 13) + '</button>' : '<span class="sp-qlock">' + ic("lock", 12) + '</span>')) +
-        '</div>';
-      });
-      h += '</div>';
-    }
-    return h;
-  }
-
-  function logsPanelHTML() {
-    const lines = playerLogs.slice().reverse();
-    const down = isResolverKnownDown();
-    let body = '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">' +
-      '<button class="btn btn-primary btn-sm" id="sp-logs-copy" style="padding:0 12px;">' + ic("copy", 14) + ' Copy all</button>' +
-      '<button class="btn btn-ghost btn-sm" id="sp-logs-clear" style="padding:0 12px;">' + ic("trash", 14) + ' Clear</button>' +
-      (down
-        ? '<button class="btn btn-ghost btn-sm" id="sp-logs-retry" style="padding:0 12px;color:#fbbf24;">↻ Retry resolvers now</button>'
-        : '<span style="font-size:11.5px;color:#4ade80;">✓ Resolvers active</span>') +
-      '<span style="font-size:11.5px;color:var(--tx-3);margin-left:auto;">' + playerLogs.length + ' entries</span></div>';
-    if (!lines.length) {
-      body += '<div style="text-align:center;padding:20px 10px;color:var(--tx-3);font-size:12px;line-height:1.6;">No playback logs yet.</div>';
-    } else {
-      body += '<div class="sp-loglist">' + lines.map(l =>
-        '<div class="sp-logline ' + (l.level === "error" ? "err" : l.level === "warn" ? "warn" : "info") + '">' +
-          '<span class="sp-log-t">' + fmtTime(l.t) + '</span>' +
-          '<span class="sp-log-l">' + l.level + '</span>' +
-          '<span class="sp-log-m">' + esc(l.msg) + '</span>' +
-        '</div>').join("") + '</div>';
-    }
-    return '<div class="sp-ph"><span>Playback Logs</span><span class="sp-ph-sub">errors &amp; diagnostics</span></div>' + body;
-  }
-
-  function wireLogsPanel() {
-    const cp = byId("sp-logs-copy");
-    if (cp) cp.addEventListener("click", () => {
-      const text = playerLogs.map(l => "[" + fmtTime(l.t) + "] " + l.level.toUpperCase() + " " + l.msg).join("\n");
-      copyText(text).then(ok => toast(ok ? "Copied " + playerLogs.length + " log lines." : "Copy failed.", ok ? "ok" : "err"));
-    });
-    const cl = byId("sp-logs-clear");
-    if (cl) cl.addEventListener("click", () => { playerLogs.length = 0; refreshPanels(); toast("Logs cleared.", "ok"); });
-    const rt = byId("sp-logs-retry");
-    if (rt) rt.addEventListener("click", () => {
-      markResolverUp();
-      logPlayer("info", "Resolver cache cleared — next track will re-probe Invidious/Piped.");
-      toast("Resolvers will be retried on the next track.", "ok");
-      refreshPanels();
-    });
-  }
-
-  let lastSearchResults = [];
-  function wireQueuePanel() {
-    $$("#sp-panel-queue [data-qtab]").forEach(b => b.addEventListener("click", () => { SP.panelTab = b.dataset.qtab; refreshPanels(); }));
-    $$("#sp-panel-queue [data-rm]").forEach(b => b.addEventListener("click", () => { dequeueAt(parseInt(b.dataset.rm, 10)); }));
-    $$("#sp-panel-queue [data-qchip]").forEach(chip => chip.addEventListener("click", () => {
-      const searchIn = byId("sp-search-in");
-      if (searchIn) { searchIn.value = chip.dataset.qchip; doSearch(chip.dataset.qchip); }
-    }));
-
-    const searchIn = byId("sp-search-in");
-    const searchGo = byId("sp-search-go");
-    const doSearch = async (forcedQuery) => {
-      const rawQ = (typeof forcedQuery === "string" ? forcedQuery : (searchIn ? searchIn.value : "")).trim();
-      if (!rawQ) return;
-      if (searchGo) searchGo.disabled = true;
-      const box = byId("sp-search-results");
-      if (box) box.innerHTML = '<div style="text-align:center;padding:24px;color:var(--tx-3);font-size:13px;"><div class="sp-spinner" style="margin:0 auto 10px;"></div>Searching for "<b>' + esc(rawQ) + '</b>"...</div>';
-      try {
-        const results = await searchYouTube(rawQ);
-        lastSearchResults = results;
-        renderSearchResults(results);
-      } catch (err) {
-        if (box) box.innerHTML = '<div style="text-align:center;padding:20px;color:var(--red);font-size:12.5px;">Search error: ' + esc(err.message) + '</div>';
-      } finally {
-        if (searchGo) searchGo.disabled = false;
-      }
-    };
-
-    if (searchGo) searchGo.addEventListener("click", () => doSearch());
-    if (searchIn) {
-      searchIn.addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
-      if (lastSearchResults.length && !searchIn.value) renderSearchResults(lastSearchResults);
-    }
-  }
-
-  function renderSearchResults(tracks) {
-    const box = byId("sp-search-results");
-    if (!box) return;
-    if (!tracks.length) {
-      box.innerHTML = '<div style="padding:20px;text-align:center;color:var(--tx-3);font-size:12.5px;">No tracks found. Try a direct YouTube link.</div>';
-      return;
-    }
-    let h = '<div style="display:flex;flex-direction:column;gap:6px;max-height:280px;overflow-y:auto;margin-top:6px;padding-right:2px;">';
-    tracks.forEach((t, i) => {
-      const art = t.thumbUrl || t.artUrl || (t.ytId ? ("https://img.youtube.com/vi/" + t.ytId + "/hqdefault.jpg") : "");
-      h += '<div class="sp-res-row">' +
-        '<div class="sp-res-art" style="background-image:url(\'' + art + '\')"></div>' +
-        '<div class="sp-res-info">' +
-          '<div class="sp-res-title" title="' + esc(t.title) + '">' + esc(t.title) + '</div>' +
-          '<div class="sp-res-artist" title="' + esc(t.artist) + '">' + esc(t.artist) + '</div>' +
-        '</div>' +
-        '<div class="sp-res-acts">' +
-          '<button class="sp-btn-sm sp-btn-queue" data-add-res="' + i + '" title="Append to queue">' + ic("plus", 12) + ' Queue</button>' +
-          '<button class="sp-btn-sm sp-btn-playnow" data-play-res="' + i + '" title="Play immediately">' + ic("spPlay", 12) + ' Play</button>' +
-        '</div>' +
-      '</div>';
-    });
-    h += '</div>';
-    box.innerHTML = h;
-
-    $$("[data-add-res]", box).forEach(b => b.addEventListener("click", async () => {
-      const idx = parseInt(b.dataset.addRes, 10);
-      const item = tracks[idx];
-      if (!item) return;
-      const added = await enqueue({ ...item });
-      if (!added) return;
-      b.innerHTML = ic("check", 12) + ' Added';
-      b.disabled = true;
-      setTimeout(() => { b.disabled = false; b.innerHTML = ic("plus", 12) + ' Queue'; }, 1500);
-    }));
-
-    $$("[data-play-res]", box).forEach(b => b.addEventListener("click", () => {
-      const idx = parseInt(b.dataset.playRes, 10);
-      const item = tracks[idx];
-      if (!item) return;
-      enqueue({ ...item }, { playNow: true });
-    }));
-  }
-
-  function refreshPanels() {
-    const pq = byId("sp-panel-queue"), pl = byId("sp-panel-lyrics"), lg = byId("sp-panel-logs");
-    if (pq) {
-      pq.classList.toggle("open", SP.openPanel === "queue");
-      if (SP.openPanel === "queue") { pq.innerHTML = queuePanelHTML(); wireQueuePanel(); }
-    }
-    if (pl) {
-      pl.classList.toggle("open", SP.openPanel === "lyrics");
-      if (SP.openPanel === "lyrics") pl.innerHTML = '<div class="sp-ph"><span>Lyrics</span></div><div class="sp-lyrics" style="text-align:center;padding:20px;color:var(--tx-3);">Lyrics not available.</div>';
-    }
-    if (lg) {
-      lg.classList.toggle("open", SP.openPanel === "logs");
-      if (SP.openPanel === "logs") { lg.innerHTML = logsPanelHTML(); wireLogsPanel(); }
-    }
-    refreshProgress();
-  }
-  function togglePanel(which) { SP.openPanel = SP.openPanel === which ? null : which; refreshPanels(); updateDock(); }
-
-  /* ---------- session lifecycle ---------- */
-  function startSpotify() {
-    if (!S.call) return toast("Join a call first to start collaborative music.", "err");
-    if (SP.on) return;
-    // If we have a fresh music snapshot from call presence, adopt its queue.
-    if (S.callMusic && Array.isArray(S.callMusic.queue) && S.callMusic.queue.length) {
-      SP.queue = S.callMusic.queue;
-      SP.index = Math.max(0, Math.min(S.callMusic.index || 0, SP.queue.length - 1));
-      S.callMusic.queue.forEach(t => { TRACK_INDEX[t.id] = t; });
-    }
-    SP.on = true;
-    if (!(SP.index >= 0 && SP.index < SP.queue.length)) SP.index = 0;
-    ensureHost();
-    const t = curTrack();
-    if (t && t.source === "audio" && t.url) playAudioTrack(t, SP.playing);
-    else if (t && t.source === "sc" && t.scUrl) loadSoundCloudTrack(t, SP.playing);
-    else if (t && t.source === "ytiframe" && t.ytId) playViaYouTubeIframe(t.ytId, SP.playing);
-    else if (t && t.ytId) loadYouTubeTrack(t.ytId, true);
-    if (!SP.tickI) SP.tickI = setInterval(tickSpotify, 250);
-    syncSpotify();
-    updateStage();
-    updateCtl();
-    toast(t ? "Music is active." : "Music mode on — search a track to start.", "ok");
-  }
-
-  function stopSpotify() {
-    if (SP.tickI) { clearInterval(SP.tickI); SP.tickI = null; }
-    pauseAudio();
-    if (audioEl) { audioEl.pause(); try { audioEl.removeAttribute("src"); audioEl.load(); } catch (e) {} }
-    pauseSoundCloud();
-    destroyYouTubePlayer();
-    scBaseUrl = "";
-    scWidget = null;
-    scWidgetReady = false;
-    const wasOn = SP.on;
-    SP.on = false; SP.playing = false; SP.openPanel = null;
-    if (wasOn) { syncSpotify(); updateCtl(); if (S.call) updateStage(); }
-  }
-
-  function toggleSpotify() {
-    if (!S.call) return toast("Join a call first.", "err");
-    if (SP.on) { stopSpotify(); return; }
-    startSpotify();
-  }
-
-  /* ======================= boot ======================= */
-  boot();
-
-  if (typeof window !== "undefined" && window.__HC_TEST__) {
-    window.__HC__ = {
-      S, DB, guilds, users,
-      logs: () => playerLogs.slice(),
-      clearLogs: () => { playerLogs.length = 0; },
-      joinCall, leaveCall, startSpotify, stopSpotify, togglePlay, nextTrack, prevTrack,
-      resolveInvidiousCandidates, loadYouTubeTrack, playViaYouTubeIframe,
-      /* voice-call internals — used by the headless smoke test */
-      openRealtime, applyActiveUsers, updateStage, tileFor, attachMedia,
-      getPeer, onIncomingCall, upsertRemote, cleanupRemote, startShareRemote, ensureShareMesh,
-      onTalkBroadcast, broadcastTalk, setTalkVisual, onSbPlay, sbBroadcast, sbPlay,
-      pushPresence, onPageResumed, kickMediaPlayback, releaseCallMedia, cleanupOnUnload,
-      toggleShare, stopShare, toggleMic
-    };
-  }
-})();
+        '<
