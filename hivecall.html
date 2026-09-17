@@ -365,6 +365,8 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
 .toast.ok .t-icon { color: var(--green); }
 .toast.err .t-icon { color: var(--red); }
 .toast.info .t-icon { color: var(--accent); }
+.toast.sound-play { padding: 10px 15px; border-color: rgba(255,255,255,.18); background: rgba(27, 29, 34, .97); }
+.toast.sound-play .t-icon { width: 22px; height: 22px; font-size: 18px; }
 .toast.invite { pointer-events: auto; flex-wrap: wrap; padding: 11px 14px 11px 18px; }
 .toast.invite .t-msg { flex: 1 1 auto; min-width: 0; }
 .toast.invite .t-actions { flex: 0 0 auto; display: flex; gap: 8px; }
@@ -1034,6 +1036,24 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     root.appendChild(el);
     requestAnimationFrame(() => el.classList.add("show"));
     setTimeout(() => { el.classList.remove("show"); setTimeout(() => el.remove(), 300); }, 2800);
+  }
+  const soundNoticeAt = {};
+  function soundPlayedNotice(p) {
+    if (!p || !p.player) return;
+    const key = String(p.player) + ":" + String(p.id || p.name || "sound");
+    const now = Date.now();
+    if (soundNoticeAt[key] && now - soundNoticeAt[key] < 2500) return;
+    soundNoticeAt[key] = now;
+    const root = byId("toasts");
+    if (!root) return;
+    const el = document.createElement("div");
+    el.className = "toast sound-play";
+    el.innerHTML = '<span class="t-icon"></span><span class="t-msg"></span>';
+    el.querySelector(".t-icon").textContent = p.emoji || "🔊";
+    el.querySelector(".t-msg").textContent = (p.name || "Sound") + " — played by " + (displayName(p.player, null) || "someone");
+    root.appendChild(el);
+    requestAnimationFrame(() => el.classList.add("show"));
+    setTimeout(() => { el.classList.remove("show"); setTimeout(() => el.remove(), 300); }, 3600);
   }
 
   /* ======================= modal helpers ======================= */
@@ -1911,6 +1931,12 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     if (kind === "sound") {
       try { mc.answer(); } catch (e) {}
       if (soundWait[uid]) { clearTimeout(soundWait[uid]); delete soundWait[uid]; }
+      soundPlayedNotice({
+        id: mc.metadata && mc.metadata.soundId,
+        name: mc.metadata && mc.metadata.name,
+        emoji: mc.metadata && mc.metadata.emoji,
+        player: (mc.metadata && mc.metadata.player) || uid
+      });
       const audio = document.createElement("audio");
       audio.autoplay = true;
       audio.playsInline = true;
@@ -2611,13 +2637,13 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     // Audio travels over the already-configured peer transport. Do not put a
     // base64 clip in the realtime event: sound files can exceed realtime
     // message limits, which also prevents the notification from arriving.
-    const rtc = playSoundboardToCall(s.dataUrl);
+    const rtc = playSoundboardToCall(s.dataUrl, s);
     const ch = getChannel(S.call.guildId);
     if (ch) {
       try { ch.send({ type: "broadcast", event: "sb_play", payload: { id: s.id, name: s.name, emoji: s.emoji, player: S.user.id, rtc: !!rtc } }); } catch (e) {}
     }
     const me = users()[S.user.id];
-    toast((s.emoji || "🔊") + " " + s.name + " — played by " + (me ? me.name : "someone"), "info");
+    soundPlayedNotice({ id: s.id, name: s.name, emoji: s.emoji, player: S.user.id });
   }
   function onSbPlay(p) {
     p = broadcastPayload(p);
@@ -2634,11 +2660,10 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     } else if (p.dataUrl && !SB.muted) {
       sbPlay(p.dataUrl);
     }
-    const nm = displayName(p.player, null);
-    toast((p.emoji || "🔊") + " " + (p.name || "sound") + " — played by " + (nm || "someone"), "info");
+    soundPlayedNotice(p);
   }
 
-  function playSoundboardToCall(audioUrl) {
+  function playSoundboardToCall(audioUrl, sound) {
     const c = S.call;
     if (!c || !audioUrl || !peerOpen || !peer) { sbPlay(audioUrl); return false; }
     try {
@@ -2671,7 +2696,10 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       roster.forEach(uid => {
         if (uid === S.user.id) return;
         try {
-          const mc = peer.call(uid, destination.stream, { metadata: { kind: "sound" } });
+          const mc = peer.call(uid, destination.stream, { metadata: {
+            kind: "sound", soundId: sound && sound.id, name: sound && sound.name,
+            emoji: sound && sound.emoji, player: S.user.id
+          } });
           calls.push(mc);
           mc.on("close", () => { const i = calls.indexOf(mc); if (i !== -1) calls.splice(i, 1); });
           mc.on("error", () => { try { mc.close(); } catch (e) {} });
