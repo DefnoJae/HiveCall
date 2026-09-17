@@ -52,7 +52,6 @@
   /* PeerJS uses a per-call endpoint. The stable app user ID stays separate so
      two tabs/reloads never steal the same PeerJS registration from each other. */
   let currentPeerId = null;
-  let currentPeerSessionToken = null;
   let peerInitializing = false;
   let peerInitTimer = null;
 
@@ -1381,14 +1380,6 @@
   /* ---------------- PeerJS mesh ---------------- */
   let peer = null, peerOpen = false, peerError = false;
 
-  function generatePeerId(userId) {
-    const bytes = new Uint32Array(4);
-    if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(bytes);
-    else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 0x100000000);
-    currentPeerSessionToken = Array.from(bytes, n => n.toString(16).padStart(8, "0")).join("");
-    return `${userId}#${currentPeerSessionToken}`;
-  }
-
   function peerTargetFor(userId) {
     const c = S.call;
     const g = c && guilds()[c.guildId];
@@ -1412,7 +1403,6 @@
     peerInitializing = false;
     peerOpen = false;
     currentPeerId = null;
-    currentPeerSessionToken = null;
     if (!peer) return;
     const doomedPeer = peer;
     peer = null;
@@ -1431,8 +1421,9 @@
     if (peerInitializing) return null;
     peerInitializing = true;
     peerError = false;
-    const endpointId = generatePeerId(S.user.id);
-    const createdPeer = new window.Peer(endpointId, { debug: 1 });
+    // Let PeerServer assign a standards-compliant random endpoint. App user IDs
+    // travel separately in call metadata and presence, so identity remains stable.
+    const createdPeer = new window.Peer({ debug: 1 });
     peer = createdPeer;
     peerInitTimer = setTimeout(() => {
       if (peer !== createdPeer || peerOpen) return;
@@ -1443,7 +1434,7 @@
     createdPeer.on("open", id => {
       if (peer !== createdPeer) return;
       if (peerInitTimer) { clearTimeout(peerInitTimer); peerInitTimer = null; }
-      currentPeerId = id || endpointId;
+      currentPeerId = id;
       peerOpen = true;
       peerInitializing = false;
       pushPresence();
@@ -1464,7 +1455,6 @@
       peerOpen = false;
       peerInitializing = false;
       currentPeerId = null;
-      currentPeerSessionToken = null;
       if (S.call) {
         pushPresence();
         setTimeout(() => { if (S.call && !peer) getPeer(); }, 1000);
