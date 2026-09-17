@@ -299,6 +299,9 @@ input, textarea, select { font-family: inherit; }
 .sb-head-acts { display: flex; gap: 8px; align-items: center; }
 .sb-add { display: inline-flex; align-items: center; gap: 5px; background: var(--green); color: #fff; border-radius: 8px; padding: 6px 10px; font-size: 12.5px; font-weight: 700; }
 .sb-add:hover { background: var(--green-2); }
+.sb-mute { display: inline-flex; align-items: center; gap: 5px; border-radius: 8px; padding: 6px 9px; color: var(--tx-2); font-size: 12px; font-weight: 700; }
+.sb-mute:hover { background: var(--bg-4); color: var(--tx); }
+.sb-mute.muted { background: rgba(242, 63, 67, .18); color: #ff989b; }
 .sb-x { width: 28px; height: 28px; border-radius: 7px; display: grid; place-items: center; color: var(--tx-3); }
 .sb-x:hover { background: var(--bg-4); color: var(--tx); }
 .sb-vol { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-bottom: 1px solid rgba(255, 255, 255, .08); color: var(--tx-2); font-size: 12.5px; }
@@ -1911,6 +1914,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       const audio = document.createElement("audio");
       audio.autoplay = true;
       audio.playsInline = true;
+      audio.muted = !!SB.muted; // local preference: notifications still arrive
       audio.srcObject = null;
       c.soundRemote.push(audio);
       mc.on("stream", s => { audio.srcObject = s; playMedia(audio); });
@@ -2585,7 +2589,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   }
 
   /* ======================= SOUND BOARD ======================= */
-  let SB = { open: false, vol: 0.8 };
+  let SB = { open: false, vol: 0.8, muted: false };
   const _sbAudio = [];
   const SB_EMOJIS = ["🔊", "😂", "😎", "🚨", "💥", "🐷", "🎉", "😲", "👤", "🐕", "🔥", "🪄", "🤖", "💨", "🎯", "🍿", "💀", "😱"];
   const sbList = () => (S.call && DB.soundboards) ? (DB.soundboards[S.call.guildId] || []) : [];
@@ -2627,7 +2631,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
         delete soundWait[p.player];
         sbPlay(p.dataUrl);
       }, 900);
-    } else if (p.dataUrl) {
+    } else if (p.dataUrl && !SB.muted) {
       sbPlay(p.dataUrl);
     }
     const nm = displayName(p.player, null);
@@ -2742,7 +2746,6 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     const me = users()[S.user.id];
     const list = rows.length ? rows.map(s => {
       const owner = users()[s.addedBy];
-      const mine = s.addedBy === S.user.id;
       return '<div class="sb-row">' +
         '<span class="sb-emoji">' + esc(s.emoji || "🔊") + "</span>" +
         '<span class="sb-info"><span class="sb-name">' + esc(s.name) + '</span>' +
@@ -2750,13 +2753,14 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
         '<button class="sb-act" data-rename="' + s.id + '" title="Rename sound">' + ic("edit", 15) + "</button>" +
         '<button class="sb-act" data-play="' + s.id + '" title="Play to the call">' + ic("sound", 15) + "</button>" +
         '<button class="sb-act" data-self="' + s.id + '" title="Preview for you">' + ic("headphone", 15) + "</button>" +
-        (mine ? '<button class="sb-act sb-del" data-del="' + s.id + '" title="Remove">' + ic("trash", 15) + "</button>" : "") +
+        '<button class="sb-act sb-del" data-del="' + s.id + '" title="Remove">' + ic("trash", 15) + "</button>" +
       "</div>";
     }).join("") : '<div class="sb-empty">No sounds in this call yet.<br><b>+ Add</b> one to share it with everyone.</div>';
     return (
       '<div class="sb-head">' +
         '<span class="sb-title">Sound Board' + (me ? ' <span class="sb-sub">' + esc(me.name) + "</span>" : "") + '</span>' +
         '<div class="sb-head-acts">' +
+          '<button class="sb-mute' + (SB.muted ? ' muted' : '') + '" id="sb-mute" title="Mute sounds played by other participants">' + ic("volume", 13) + (SB.muted ? ' Unmute' : ' Mute') + '</button>' +
           '<button class="sb-add" id="sb-add">' + ic("plus", 13) + " Add</button>" +
           '<button class="sb-x" id="sb-x">' + ic("x", 15) + "</button>" +
         "</div>" +
@@ -2774,6 +2778,13 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     const find = id => sbAllInCall().find(s => s.id === id);
     byId("sb-x").addEventListener("click", toggleSoundboard);
     byId("sb-add").addEventListener("click", addSoundModal);
+    byId("sb-mute").addEventListener("click", () => {
+      SB.muted = !SB.muted;
+      const c = S.call;
+      if (c) (c.soundRemote || []).forEach(audio => { audio.muted = SB.muted; });
+      renderSoundboard();
+      toast(SB.muted ? "Sound board muted for you. Notifications stay on." : "Sound board unmuted.", "info");
+    });
     byId("sb-vol").addEventListener("input", e => {
       SB.vol = parseFloat(e.target.value) || 0.8;
       const v = byId("sb-vol-v");
@@ -2788,30 +2799,35 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     if (!s || !S.call || !supabaseClient) return;
     showModal(
       '<div class="modal" style="width:400px;">' +
-        '<div class="modal-head"><h3>' + ic("edit", 17) + ' Rename sound</h3><button class="modal-x" data-close>' + ic("x", 16) + '</button></div>' +
-        '<div class="modal-body"><div class="field"><label>Sound name</label><input id="sb-rename-name" type="text" maxlength="32" value="' + esc(s.name) + '" autocomplete="off"></div></div>' +
+        '<div class="modal-head"><h3>' + ic("edit", 17) + ' Edit sound</h3><button class="modal-x" data-close>' + ic("x", 16) + '</button></div>' +
+        '<div class="modal-body"><div class="field"><label>Sound name</label><input id="sb-rename-name" type="text" maxlength="32" value="' + esc(s.name) + '" autocomplete="off"></div>' +
+        '<div class="field"><label>Emoji</label><input id="sb-rename-emoji" type="text" maxlength="8" value="' + esc(s.emoji || "🔊") + '" autocomplete="off">' +
+          '<div class="swatch-row" style="margin-top:8px;">' + SB_EMOJIS.map(e => '<span class="sb-emoji-pick" data-rename-emoji="' + e + '">' + e + '</span>').join("") + '</div></div></div>' +
         '<div class="modal-foot"><button class="btn btn-ghost" data-close>Cancel</button><button class="btn btn-primary" id="sb-rename-save" style="width:auto;">Save</button></div>' +
       '</div>'
     );
     const input = byId("sb-rename-name");
+    const emojiInput = byId("sb-rename-emoji");
     if (input) { input.focus(); input.select(); }
+    $$("[data-rename-emoji]").forEach(b => b.addEventListener("click", () => { if (emojiInput) emojiInput.value = b.dataset.renameEmoji; }));
     const save = () => {
       const name = (input && input.value || "").trim();
+      const emoji = (emojiInput && emojiInput.value || "🔊").trim() || "🔊";
       if (!name) return toast("Give the sound a name.", "err");
-      supabaseClient.from("soundboard").update({ name }).eq("id", s.id).eq("server_id", S.call.guildId)
+      supabaseClient.from("soundboard").update({ name, emoji }).eq("id", s.id).eq("server_id", S.call.guildId)
         .then(({ error }) => {
           if (error) return toast("Could not rename sound: " + error.message, "err");
           const local = sbAllInCall().find(x => x.id === s.id);
-          if (local) local.name = name;
+          if (local) { local.name = name; local.emoji = emoji; }
           closeModal(); renderSoundboard();
-          toast("Sound renamed to " + name + ".", "ok");
+          toast("Updated " + emoji + " " + name + ".", "ok");
         });
     };
     byId("sb-rename-save").addEventListener("click", save);
     if (input) input.addEventListener("keydown", e => { if (e.key === "Enter") save(); });
   }
   function sbDelete(s) {
-    if (!s || s.addedBy !== S.user.id || !supabaseClient) return;
+    if (!s || !supabaseClient) return;
     supabaseClient.from("soundboard").delete().eq("id", s.id).eq("server_id", s.server_id || S.call.guildId)
       .then(() => {
         DB.soundboards[S.call.guildId] = (DB.soundboards[S.call.guildId] || []).filter(x => x.id !== s.id);
