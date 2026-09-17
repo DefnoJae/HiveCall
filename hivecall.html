@@ -578,6 +578,13 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   const prefs = () => lsGet("hc_prefs", { autoMute: false, sounds: true, micId: "", camId: "" });
   const savePrefs = p => lsSet("hc_prefs", p);
 
+  /* PeerJS uses a per-call endpoint. The stable app user ID stays separate so
+     two tabs/reloads never steal the same PeerJS registration from each other. */
+  let currentPeerId = null;
+  let currentPeerSessionToken = null;
+  let peerInitializing = false;
+  let peerInitTimer = null;
+
   /* ======================= Supabase data layer ======================= */
   const hashColor = seed => {
     let h = 0; for (const cc of String(seed || "")) h = (h * 31 + cc.charCodeAt(0)) | 0;
@@ -677,7 +684,8 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
         const mine = users()[S.user.id] || { name: S.user.name, color: S.user.color };
         roster[S.user.id] = {
           name: mine.name || S.user.name, color: mine.color || S.user.color,
-          mic: !!S.call.mic, cam: !!S.call.cam, share: !!S.call.share, joinedAt: S.call.joinAt
+          mic: !!S.call.mic, cam: !!S.call.cam, share: !!S.call.share, joinedAt: S.call.joinAt,
+          peerId: currentPeerId || ""
         };
         ensureProfile(S.user.id, roster[S.user.id].name, roster[S.user.id].color);
       }
@@ -790,7 +798,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     if (!ch) return;
     try {
       ch.send({ type: "broadcast", event: "state", payload: {
-        from: S.user.id, mic: !!c.mic, cam: !!c.cam, share: !!c.share,
+        from: S.user.id, mic: !!c.mic, cam: !!c.cam, share: !!c.share, peerId: currentPeerId || "",
         name: S.user.name, color: S.user.color
       } });
     } catch (e) {}
@@ -835,13 +843,18 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     if (!S.call || !p || !p.from || p.from === S.user.id) return;
     const g = guilds()[S.call.guildId];
     if (!g) return;
-    const r = g.roster[p.from];
-    if (!r) return;
+    let r = g.roster[p.from];
+    if (!r) {
+      r = g.roster[p.from] = { name: p.name || "", color: p.color || "", mic: false, cam: false, share: false, joinedAt: Date.now(), peerId: "" };
+      if (!g.call.includes(p.from)) g.call.push(p.from);
+    }
     const prevShare = !!r.share;
     r.mic = !!p.mic;
     r.cam = !!p.cam;
     r.share = !!p.share;
+    if (typeof p.peerId === "string") r.peerId = p.peerId;
     if (p.name || p.color) ensureProfile(p.from, p.name, p.color);
+    if (peerOpen && S.user.id < p.from) callUser(p.from);
     // "X is presenting" needs to appear instantly (the DB presence event lags).
     if (S.call.sharePending) {
       if (r.share && !prevShare) S.call.sharePending[p.from] = true;
@@ -857,7 +870,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     const c = S.call; if (!c || !S.user) return;
     sendState();
     writePresence(c.guildId, {
-      [S.user.id]: { name: S.user.name, color: S.user.color, mic: !!c.mic, cam: !!c.cam, share: !!c.share, joinedAt: c.joinAt }
+      [S.user.id]: { name: S.user.name, color: S.user.color, mic: !!c.mic, cam: !!c.cam, share: !!c.share, joinedAt: c.joinAt, peerId: currentPeerId || "" }
     });
   }
   function pushMusic() {
@@ -876,11 +889,12 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   /* Real-time channels: messages, call_presence, soundboard + broadcast. */
   let hcChannels = [];
   function closeRealtime() { hcChannels.forEach(ch => { try { supabaseClient.removeChannel(ch); } catch (e) {} }); hcChannels = []; }
-  function getChannel(gid) { return hcChannels.find(ch => ch.topic === "hc-" + gid) || null; }
+  function getChannel(gid) { return hcChannels.find(ch => ch._hcGuildId === gid) || null; }
   function openRealtime(gid) {
     if (!supabaseClient) return;
     closeRealtime();
     const ch = supabaseClient.channel("hc-" + gid);
+    ch._hcGuildId = gid;
     ch.on("postgres_changes", { event: "INSERT", schema: "public", table: "messages", filter: "server_id=eq." + gid },
       payload => appendChatMsg(payload.new));
     ch.on("postgres_changes", { event: "INSERT", schema: "public", table: "call_presence", filter: "server_id=eq." + gid },
@@ -1747,7 +1761,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     g.roster[S.user.id] = { name: S.user.name, color: S.user.color, mic: false, cam: false, share: false, joinedAt: now };
     if (!g.call.includes(S.user.id)) g.call.push(S.user.id);
     if (!DB.profiles[S.user.id]) DB.profiles[S.user.id] = { id: S.user.id, name: S.user.name, color: S.user.color };
-    writePresence(g.id, { [S.user.id]: { name: S.user.name, color: S.user.color, mic: false, cam: false, share: false, joinedAt: now } });
+    writePresence(g.id, { [S.user.id]: { name: S.user.name, color: S.user.color, mic: false, cam: false, share: false, joinedAt: now, peerId: "" } });
     renderCall();
     bootMedia();
     startCallTimer();
@@ -1769,10 +1783,10 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     Object.keys(c.shareMc || {}).forEach(k => { try { c.shareMc[k].close(); } catch (e) {} });
     (c.soundMc || []).forEach(mc => { try { mc.close(); } catch (e) {} });
     (c.soundLocal || []).forEach(item => { try { item.audio.pause(); item.audio.src = ""; } catch (e) {} try { item.ctx.close(); } catch (e) {} });
-    (c.soundRemote || []).forEach(audio => { try { audio.pause(); audio.srcObject = null; } catch (e) {} });
+    (c.soundRemote || []).forEach(audio => { try { audio.pause(); audio.srcObject = null; } catch (e) {} try { audio.remove(); } catch (e) {} });
     Object.keys(c.remote || {}).forEach(k => unwatchTalkLevel(k));
-    if (peer && !peer.destroyed) { try { peer.destroy(); } catch (e) {} }
-    peer = null; peerOpen = false; peerError = false;
+    destroyPeer();
+    peerError = false;
     if (c.stream) c.stream.getTracks().forEach(t => t.stop());
     if (c.display) c.display.getTracks().forEach(t => t.stop());
     unwatchTalkLevel(S.user.id);
@@ -1811,9 +1825,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     // A bfcache/background page has not really been left — only tear the call
     // down (and remove ourselves from presence) on a real unload.
     if (e && e.persisted) return;
-    try {
-      if (peer && !peer.destroyed) peer.destroy();
-    } catch (e2) {}
+    destroyPeer();
     const c = S.call;
     if (c) { releaseCallMedia(); beaconPresence(c.guildId); }   // remove self from active_users
     stopPresenceBeat();
@@ -1886,6 +1898,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       (c.soundRemote || []).forEach(a => {
         try { a.pause(); } catch (e) {}
         try { a.srcObject = null; } catch (e) {}
+        try { a.remove(); } catch (e) {}
       });
       c.soundRemote.length = 0;
     }
@@ -1896,6 +1909,45 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
 
   /* ---------------- PeerJS mesh ---------------- */
   let peer = null, peerOpen = false, peerError = false;
+
+  function generatePeerId(userId) {
+    const bytes = new Uint32Array(4);
+    if (window.crypto && window.crypto.getRandomValues) window.crypto.getRandomValues(bytes);
+    else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 0x100000000);
+    currentPeerSessionToken = Array.from(bytes, n => n.toString(16).padStart(8, "0")).join("");
+    return `${userId}#${currentPeerSessionToken}`;
+  }
+
+  function peerTargetFor(userId) {
+    const c = S.call;
+    const g = c && guilds()[c.guildId];
+    const entry = g && g.roster && g.roster[userId];
+    return entry && entry.peerId ? entry.peerId : "";
+  }
+
+  function callMetadata(kind, extra) {
+    const c = S.call;
+    return Object.assign({ kind, userId: S.user && S.user.id, guildId: c && c.guildId }, extra || {});
+  }
+
+  function userIdFromCall(mc) {
+    const metaId = mc && mc.metadata && mc.metadata.userId;
+    if (metaId) return String(metaId);
+    return String(mc && mc.peer || "").split("#")[0];
+  }
+
+  function destroyPeer() {
+    if (peerInitTimer) { clearTimeout(peerInitTimer); peerInitTimer = null; }
+    peerInitializing = false;
+    peerOpen = false;
+    currentPeerId = null;
+    currentPeerSessionToken = null;
+    if (!peer) return;
+    const doomedPeer = peer;
+    peer = null;
+    try { if (!doomedPeer.destroyed) doomedPeer.destroy(); } catch (e) {}
+  }
+
   function getPeer() {
     if (typeof window.Peer === "undefined") {
       if (!peerError) { peerError = true; toast("PeerJS network is ready in the <head> tag — it seems to be missing.", "err"); }
@@ -1905,16 +1957,58 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       if (peer.disconnected) { try { peer.reconnect(); } catch (e) {} }
       return peer;
     }
+    if (peerInitializing) return null;
+    peerInitializing = true;
     peerError = false;
-    peer = new window.Peer(S.user.id, { debug: 1 });
-    peer.on("open", () => { peerOpen = true; tryMesh(); ensureShareMesh(); });
+    const endpointId = generatePeerId(S.user.id);
+    const createdPeer = new window.Peer(endpointId, { debug: 1 });
+    peer = createdPeer;
+    peerInitTimer = setTimeout(() => {
+      if (peer !== createdPeer || peerOpen) return;
+      console.warn("PeerJS initialization timed out; retrying");
+      destroyPeer();
+      if (S.call) setTimeout(getPeer, 500);
+    }, 12000);
+    createdPeer.on("open", id => {
+      if (peer !== createdPeer) return;
+      if (peerInitTimer) { clearTimeout(peerInitTimer); peerInitTimer = null; }
+      currentPeerId = id || endpointId;
+      peerOpen = true;
+      peerInitializing = false;
+      pushPresence();
+      tryMesh();
+      ensureShareMesh();
+    });
     // The signalling socket drops whenever a tab sleeps — reconnect instead of
     // staying silently deaf for the rest of the call.
-    peer.on("disconnected", () => { if (S.call) { try { peer.reconnect(); } catch (e) {} } });
-    peer.on("close", () => { peerOpen = false; });
-    peer.on("error", e => { peerError = true; if (e && e.type === "unavailable-id") console.warn("peer id conflict", e); });
-    peer.on("call", onIncomingCall);
-    return peer;
+    createdPeer.on("disconnected", () => {
+      if (peer !== createdPeer) return;
+      peerOpen = false;
+      if (S.call) { try { createdPeer.reconnect(); } catch (e) {} }
+    });
+    createdPeer.on("close", () => {
+      if (peer !== createdPeer) return;
+      if (peerInitTimer) { clearTimeout(peerInitTimer); peerInitTimer = null; }
+      peer = null;
+      peerOpen = false;
+      peerInitializing = false;
+      currentPeerId = null;
+      currentPeerSessionToken = null;
+      if (S.call) {
+        pushPresence();
+        setTimeout(() => { if (S.call && !peer) getPeer(); }, 1000);
+      }
+    });
+    createdPeer.on("error", e => {
+      if (peer !== createdPeer) return;
+      peerError = true;
+      if (e && e.type === "unavailable-id") {
+        destroyPeer();
+        if (S.call) setTimeout(getPeer, 250 + Math.random() * 500);
+      }
+    });
+    createdPeer.on("call", onIncomingCall);
+    return createdPeer;
   }
   function tryMesh() {
     const c = S.call;
@@ -1926,18 +2020,26 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   function callUser(uid) {
     const c = S.call;
     if (!c || !c.stream || !peerOpen || !peer) return;
-    if (c.peers[uid] && c.peers[uid].open) return;
+    const targetPeerId = peerTargetFor(uid);
+    if (!targetPeerId) return;
+    if (c.peers[uid] && c.peers[uid].open && c.peers[uid]._hcTargetPeerId === targetPeerId) return;
+    if (c.peers[uid]) { try { c.peers[uid].close(); } catch (e) {} delete c.peers[uid]; }
     try {
-      const mc = peer.call(uid, c.stream, { metadata: { kind: "main" } });
+      const mc = peer.call(targetPeerId, c.stream, { metadata: callMetadata("main") });
+      mc._hcTargetPeerId = targetPeerId;
       c.peers[uid] = mc;
       mc.on("stream", s => upsertRemote(uid, s));
-      mc.on("close", () => cleanupRemote(uid));
-      mc.on("error", () => cleanupRemote(uid));
+      mc.on("close", () => cleanupRemote(uid, mc));
+      mc.on("error", () => cleanupRemote(uid, mc));
     } catch (e) { console.warn("callUser failed", uid, e); }
   }
   function onIncomingCall(mc) {
-    const c = S.call, uid = mc.peer;
+    const c = S.call, uid = userIdFromCall(mc);
     if (!c) { try { mc.close(); } catch (e) {} return; }
+    if (!uid || uid === S.user.id || (mc.metadata && mc.metadata.guildId && mc.metadata.guildId !== c.guildId)) {
+      try { mc.close(); } catch (e) {}
+      return;
+    }
     const kind = mc.metadata && mc.metadata.kind ? mc.metadata.kind : "";
     const roster = (guilds()[c.guildId] || {}).roster || {};
     const haveMain = !!(c.peers[uid] && c.peers[uid].open);
@@ -1946,7 +2048,6 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     // is sharing their screen would be mistaken for the share stream.
     if (kind === "sound") {
       try { mc.answer(); } catch (e) {}
-      if (soundWait[uid]) { clearTimeout(soundWait[uid]); delete soundWait[uid]; }
       soundPlayedNotice({
         id: mc.metadata && mc.metadata.soundId,
         name: mc.metadata && mc.metadata.name,
@@ -1958,9 +2059,20 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       audio.playsInline = true;
       audio.muted = !!SB.muted; // local preference: notifications still arrive
       audio.srcObject = null;
+      audio.style.display = "none";
+      document.body.appendChild(audio);
       c.soundRemote.push(audio);
-      mc.on("stream", s => { audio.srcObject = s; playMedia(audio); });
-      const remove = () => { const i = c.soundRemote.indexOf(audio); if (i !== -1) c.soundRemote.splice(i, 1); try { audio.pause(); audio.srcObject = null; } catch (e) {} };
+      mc.on("stream", s => {
+        if (soundWait[uid]) { clearTimeout(soundWait[uid]); delete soundWait[uid]; }
+        audio.srcObject = s;
+        playMedia(audio);
+      });
+      const remove = () => {
+        const i = c.soundRemote.indexOf(audio);
+        if (i !== -1) c.soundRemote.splice(i, 1);
+        try { audio.pause(); audio.srcObject = null; } catch (e) {}
+        try { audio.remove(); } catch (e) {}
+      };
       mc.on("close", remove);
       mc.on("error", remove);
       return;
@@ -1980,11 +2092,13 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       mc.on("error", drop);
       return;
     }
+    if (kind === "main" && haveMain) { try { mc.close(); } catch (e) {} return; }
     try { mc.answer(c.stream || undefined); } catch (e) {}
+    mc._hcTargetPeerId = mc.peer;
     if (!c.peers[uid] || !c.peers[uid].open) c.peers[uid] = mc;
     mc.on("stream", s => upsertRemote(uid, s));
-    mc.on("close", () => cleanupRemote(uid));
-    mc.on("error", () => cleanupRemote(uid));
+    mc.on("close", () => cleanupRemote(uid, mc));
+    mc.on("error", () => cleanupRemote(uid, mc));
   }
   function upsertRemote(uid, src) {
     const c = S.call; if (!c) return;
@@ -2002,11 +2116,11 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     if (r.watching && !r.audio) { r.watching = false; unwatchTalkLevel(uid); }
     updateStage();
   }
-  function cleanupRemote(uid) {
+  function cleanupRemote(uid, closedMc) {
     const c = S.call;
     if (!c) return;
-    const still = Object.keys(c.peers).some(k => c.peers[k] && c.peers[k].open && !(c.peers[k] === c.shareMc[uid]));
-    if (c.shareMc[uid]) { delete c.shareMc[uid]; }
+    if (closedMc && c.peers[uid] === closedMc) delete c.peers[uid];
+    const still = !!(c.peers[uid] && c.peers[uid].open);
     if (!still) { unwatchTalkLevel(uid); delete c.remote[uid]; clearTalkState(uid); }
     pruneIfGone(uid);
     updateStage();
@@ -2033,10 +2147,14 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     const roster = (guilds()[c.guildId] || {}).call || [];
     roster.forEach(uid => {
       if (uid === S.user.id) return;
+      const targetPeerId = peerTargetFor(uid);
+      if (!targetPeerId) return;
       const existing = c.shareMc[uid];
-      if (existing && existing.open) return;
+      if (existing && existing.open && existing._hcTargetPeerId === targetPeerId) return;
+      if (existing) { try { existing.close(); } catch (e) {} delete c.shareMc[uid]; }
       try {
-        const mc = peer.call(uid, s, { metadata: { kind: "share" } });
+        const mc = peer.call(targetPeerId, s, { metadata: callMetadata("share") });
+        mc._hcTargetPeerId = targetPeerId;
         c.shareMc[uid] = mc;
         dialed++;
         mc.on("close", () => { if (c.shareMc[uid] === mc) delete c.shareMc[uid]; });
@@ -2671,8 +2789,8 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       if (soundWait[p.player]) clearTimeout(soundWait[p.player]);
       soundWait[p.player] = setTimeout(() => {
         delete soundWait[p.player];
-        sbPlay(p.dataUrl);
-      }, 900);
+        if (!SB.muted) sbPlay(p.dataUrl);
+      }, 2500);
     } else if (p.dataUrl && !SB.muted) {
       sbPlay(p.dataUrl);
     }
@@ -2711,11 +2829,14 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       const roster = (guilds()[c.guildId] || {}).call || [];
       roster.forEach(uid => {
         if (uid === S.user.id) return;
+        const targetPeerId = peerTargetFor(uid);
+        if (!targetPeerId) return;
         try {
-          const mc = peer.call(uid, destination.stream, { metadata: {
-            kind: "sound", soundId: sound && sound.id, name: sound && sound.name,
+          const mc = peer.call(targetPeerId, destination.stream, { metadata: callMetadata("sound", {
+            soundId: sound && sound.id, name: sound && sound.name,
             emoji: sound && sound.emoji, player: S.user.id
-          } });
+          }) });
+          mc._hcTargetPeerId = targetPeerId;
           calls.push(mc);
           mc.on("close", () => { const i = calls.indexOf(mc); if (i !== -1) calls.splice(i, 1); });
           mc.on("error", () => { try { mc.close(); } catch (e) {} });
@@ -4597,3 +4718,4 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   }
 })();
 </script>
+
