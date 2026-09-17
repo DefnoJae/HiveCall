@@ -200,9 +200,9 @@
     }
     if (origin !== "local" && S.call && S.call.guildId === g.id) {
       if (S.callMusic && SP.on) applySpotifySync(S.callMusic);
-      // Dial users we aren't connected to yet (lower-id initiates to avoid double-dials).
+      // Publish our one-way main stream to every participant with an endpoint.
       if (peerOpen && S.call && S.call.guildId === g.id) {
-        g.call.forEach(id => { if (id !== S.user.id && S.user.id < id) callUser(id); });
+        g.call.forEach(id => { if (id !== S.user.id) callUser(id); });
         if (S.call.share) ensureShareMesh();     // late joiners get the screen share too
       }
       if (byId("call-view")) {
@@ -324,7 +324,7 @@
     r.share = !!p.share;
     if (typeof p.peerId === "string") r.peerId = p.peerId;
     if (p.name || p.color) ensureProfile(p.from, p.name, p.color);
-    if (peerOpen && S.user.id < p.from) callUser(p.from);
+    if (peerOpen) callUser(p.from);
     // "X is presenting" needs to appear instantly (the DB presence event lags).
     if (S.call.sharePending) {
       if (r.share && !prevShare) S.call.sharePending[p.from] = true;
@@ -1224,7 +1224,7 @@
     S.call = {
       guildId: g.id, joinAt: now, mic: false, cam: false, share: false,
       stream: null, display: null, hasMedia: false, shareWaiting: false,
-      peers: {}, shareMc: {}, soundMc: [], soundLocal: [], soundRemote: [], remote: {}, remoteShare: null, sharePending: {}
+      peers: {}, incomingPeers: {}, shareMc: {}, soundMc: [], soundLocal: [], soundRemote: [], remote: {}, remoteShare: null, sharePending: {}
     };
     // Reflect self in the roster immediately (locally + Supabase).
     g.roster = g.roster || {};
@@ -1250,6 +1250,7 @@
     releaseCallMedia();
     stopPresenceBeat();
     Object.keys(c.peers || {}).forEach(k => { try { c.peers[k].close(); } catch (e) {} });
+    Object.keys(c.incomingPeers || {}).forEach(k => { try { c.incomingPeers[k].close(); } catch (e) {} });
     Object.keys(c.shareMc || {}).forEach(k => { try { c.shareMc[k].close(); } catch (e) {} });
     (c.soundMc || []).forEach(mc => { try { mc.close(); } catch (e) {} });
     (c.soundLocal || []).forEach(item => { try { item.audio.pause(); item.audio.src = ""; } catch (e) {} try { item.ctx.close(); } catch (e) {} });
@@ -1475,8 +1476,10 @@
     const c = S.call;
     if (!c || !c.stream || !peerOpen) return;
     const roster = (guilds()[c.guildId] || {}).call || [];
-    // Lower-id side initiates so we never double-dial the same pair.
-    roster.forEach(id => { if (id !== S.user.id && S.user.id < id) callUser(id); });
+    // Each participant publishes one outbound main stream to every other peer.
+    // This mirrors the reliable one-way soundboard/share transport and avoids a
+    // single bidirectional offer becoming the failure point for both users.
+    roster.forEach(id => { if (id !== S.user.id) callUser(id); });
   }
   function callUser(uid) {
     const c = S.call;
@@ -1489,7 +1492,8 @@
       const mc = peer.call(targetPeerId, c.stream, { metadata: callMetadata("main") });
       mc._hcTargetPeerId = targetPeerId;
       c.peers[uid] = mc;
-      mc.on("stream", s => upsertRemote(uid, s));
+      // Backward compatibility: older clients may still answer with media.
+      mc.on("stream", s => { mc._hcReceivesRemote = true; upsertRemote(uid, s); });
       mc.on("close", () => cleanupRemote(uid, mc));
       mc.on("error", () => cleanupRemote(uid, mc));
     } catch (e) { console.warn("callUser failed", uid, e); }
@@ -1503,7 +1507,8 @@
     }
     const kind = mc.metadata && mc.metadata.kind ? mc.metadata.kind : "";
     const roster = (guilds()[c.guildId] || {}).roster || {};
-    const haveMain = !!(c.peers[uid] && c.peers[uid].open);
+    c.incomingPeers = c.incomingPeers || {};
+    const haveMain = !!((c.incomingPeers[uid] && c.incomingPeers[uid].open) || (c.peers[uid] && c.peers[uid].open));
     // Sound-board clips arrive on their own media connection and must be routed
     // before the screen-share heuristic, otherwise a clip played by someone who
     // is sharing their screen would be mistaken for the share stream.
@@ -1553,10 +1558,11 @@
       mc.on("error", drop);
       return;
     }
-    if (kind === "main" && haveMain) { try { mc.close(); } catch (e) {} return; }
-    try { mc.answer(c.stream || undefined); } catch (e) {}
+    if (kind === "main" && c.incomingPeers[uid]) { try { c.incomingPeers[uid].close(); } catch (e) {} }
+    try { mc.answer(); } catch (e) {}
     mc._hcTargetPeerId = mc.peer;
-    if (!c.peers[uid] || !c.peers[uid].open) c.peers[uid] = mc;
+    mc._hcReceivesRemote = true;
+    c.incomingPeers[uid] = mc;
     mc.on("stream", s => upsertRemote(uid, s));
     mc.on("close", () => cleanupRemote(uid, mc));
     mc.on("error", () => cleanupRemote(uid, mc));
@@ -1581,7 +1587,9 @@
     const c = S.call;
     if (!c) return;
     if (closedMc && c.peers[uid] === closedMc) delete c.peers[uid];
-    const still = !!(c.peers[uid] && c.peers[uid].open);
+    if (closedMc && c.incomingPeers && c.incomingPeers[uid] === closedMc) delete c.incomingPeers[uid];
+    const still = !!((c.incomingPeers && c.incomingPeers[uid] && c.incomingPeers[uid].open) ||
+      (c.peers[uid] && c.peers[uid].open && c.peers[uid]._hcReceivesRemote));
     if (!still) { unwatchTalkLevel(uid); delete c.remote[uid]; clearTalkState(uid); }
     pruneIfGone(uid);
     updateStage();
@@ -1591,7 +1599,7 @@
   function pruneIfGone(uid) {
     const c = S.call;
     if (!c || !uid || uid === S.user.id) return;
-    const open = Object.keys(c.peers || {}).some(k => k === uid && c.peers[k] && c.peers[k].open);
+    const open = !!((c.peers[uid] && c.peers[uid].open) || (c.incomingPeers && c.incomingPeers[uid] && c.incomingPeers[uid].open));
     if (open) return;
     const mirror = ROSTER_MIRROR[c.guildId];
     if (mirror && mirror[uid]) return;
@@ -1816,7 +1824,7 @@
         '<div style="font-size:13px;color:#8b8f97;margin-top:4px;">Waiting for the presentation stream…</div>' +
       "</div></div>";
     return '<div class="tile share-tile pres">' +
-      (stream ? '<video id="share-video" autoplay playsinline></video>' : art) +
+      (stream ? '<video id="share-video" autoplay playsinline muted></video><audio id="share-audio" autoplay playsinline hidden></audio>' : art) +
       '<div class="sharing-badge">' + ic("share", 13) + " LIVE</div>" +
       '<div class="tile-tag"><span class="mic-badge on">' + ic("share", 13) + '</span><span>Screen · ' + esc(label) + "</span></div>" +
     "</div>";
@@ -1857,13 +1865,20 @@
     });
     // --- screen share ---
     const sv = byId("share-video");
+    const sa = byId("share-audio");
     const shareStream = c.display || (c.remoteShare ? c.remoteShare.stream : null);
     if (sv && shareStream) {
       if (sv.srcObject !== shareStream) sv.srcObject = shareStream;
-      sv.muted = !!c.share;          // mute own screen-share preview (echo)
+      // Keep video muted so browser autoplay policy can never block the screen.
+      // Remote share audio is played through a separate audio-only element.
+      sv.muted = true;
       playMedia(sv);
       sv.hidden = false;
     } else if (sv) { sv.hidden = true; sv.srcObject = null; }
+    if (sa && shareStream && !c.share && shareStream.getAudioTracks().length) {
+      if (sa.srcObject !== shareStream) sa.srcObject = shareStream;
+      playMedia(sa);
+    } else if (sa) { try { sa.pause(); } catch (e) {} sa.srcObject = null; }
   }
 
   function bootMedia() {
@@ -1961,27 +1976,17 @@
     return out;
   }
   function renegotiateCamOn() {
-    const c = S.call; if (!c || !c.stream) return;
-    const vt = c.stream.getVideoTracks()[0];
-    openPeers().forEach(uid => {
-      if (!vt) return;
-      const mc = c.peers[uid];
-      try {
-        const sending = mc.peerConnection.getSenders().some(s => s.track === vt);
-        if (!sending) mc.peerConnection.addTrack(vt, c.stream);
-      } catch (e) { }
-    });
-    openPeers().forEach(uid => sendRenegotiation(uid));
+    redialMainMesh();
   }
   function renegotiateCamOff() {
-    const c = S.call; if (!c) return;
-    openPeers().forEach(uid => {
-      const mc = c.peers[uid];
-      try {
-        mc.peerConnection.getSenders().forEach(s => { if (s.track && s.track.kind === "video") mc.peerConnection.removeTrack(s); });
-      } catch (e) { }
-    });
-    openPeers().forEach(uid => sendRenegotiation(uid));
+    redialMainMesh();
+  }
+  function redialMainMesh() {
+    const c = S.call;
+    if (!c || !c.stream || !peerOpen) return;
+    Object.keys(c.peers || {}).forEach(uid => { try { c.peers[uid].close(); } catch (e) {} });
+    c.peers = {};
+    tryMesh();
   }
   function sendRenegotiation(uid) {
     const c = S.call; if (!c) return;
