@@ -2604,13 +2604,13 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   const soundWait = {};          // compatibility timer for clips from older clients
   function sbBroadcast(s) {
     if (!S.call || !s || !supabaseClient) return;
-    // A one-off WebRTC connection begins negotiating after the clip starts,
-    // cutting off the opening for listeners. Broadcast the stored clip instead
-    // so every recipient begins at time zero on their own device.
-    sbPlay(s.dataUrl);
+    // Audio travels over the already-configured peer transport. Do not put a
+    // base64 clip in the realtime event: sound files can exceed realtime
+    // message limits, which also prevents the notification from arriving.
+    const rtc = playSoundboardToCall(s.dataUrl);
     const ch = getChannel(S.call.guildId);
     if (ch) {
-      try { ch.send({ type: "broadcast", event: "sb_play", payload: { id: s.id, name: s.name, emoji: s.emoji, dataUrl: s.dataUrl, player: S.user.id, rtc: false } }); } catch (e) {}
+      try { ch.send({ type: "broadcast", event: "sb_play", payload: { id: s.id, name: s.name, emoji: s.emoji, player: S.user.id, rtc: !!rtc } }); } catch (e) {}
     }
     const me = users()[S.user.id];
     toast((s.emoji || "🔊") + " " + s.name + " — played by " + (me ? me.name : "someone"), "info");
@@ -2627,7 +2627,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
         delete soundWait[p.player];
         sbPlay(p.dataUrl);
       }, 900);
-    } else {
+    } else if (p.dataUrl) {
       sbPlay(p.dataUrl);
     }
     const nm = displayName(p.player, null);
@@ -2641,6 +2641,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       const audio = new Audio(audioUrl);
       audio.crossOrigin = "anonymous";
       audio.volume = SB.vol;
+      audio.preload = "auto";
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       const source = ctx.createMediaElementSource(audio);
       const speakers = ctx.createGain();
@@ -2676,7 +2677,26 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       // A suspended context is silent for us *and* for the peers (they receive
       // this context's output stream), so nudge it awake.
       if (ctx.state === "suspended") { try { const pr = ctx.resume(); if (pr && pr.catch) pr.catch(() => {}); } catch (e) {} }
-      audio.play().catch(() => {});
+      // Do not begin a short clip until the media calls are connected. Starting
+      // immediately is why remote listeners heard silence or lost the first
+      // second while WebRTC was still negotiating.
+      let started = false;
+      const deadline = Date.now() + 1500;
+      const startWhenReady = () => {
+        if (started) return;
+        const ready = !calls.length || calls.every(mc => {
+          const pc = mc && mc.peerConnection;
+          if (!pc) return false;
+          return pc.connectionState === "connected" ||
+            pc.iceConnectionState === "connected" ||
+            pc.iceConnectionState === "completed";
+        });
+        if (!ready && Date.now() < deadline) return setTimeout(startWhenReady, 40);
+        started = true;
+        audio.play().catch(() => {});
+      };
+      audio.addEventListener("canplay", startWhenReady, { once: true });
+      startWhenReady();
       return calls.length > 0;
     } catch (e) {
       sbPlay(audioUrl);
