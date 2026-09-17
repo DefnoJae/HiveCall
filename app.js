@@ -298,8 +298,6 @@
   let hcChannels = [];
   function closeRealtime() { hcChannels.forEach(ch => { try { supabaseClient.removeChannel(ch); } catch (e) {} }); hcChannels = []; }
   
-  // FIX: Supabase JS v2 prepends "realtime:" to the topic property internally. 
-  // By matching on index 0 directly, we bypass any topic parsing issues ensuring broadcasts always send properly!
   function getChannel(gid) { return hcChannels[0] || null; }
   
   function openRealtime(gid) {
@@ -558,7 +556,7 @@
       const m = $(".dropdown:not(.hidden)");
       if (m && !m.contains(e.target)) m.classList.add("hidden");
     });
-    window.addEventListener("pagehide", e => cleanupOnUnload(e));
+    // FIX: Removing pagehide ensures tab switching never accidentally triggers a disconnect
     window.addEventListener("beforeunload", () => cleanupOnUnload({ persisted: false }));
     document.addEventListener("visibilitychange", () => { if (!document.hidden) onPageResumed(); });
     window.addEventListener("focus", () => onPageResumed());
@@ -1122,8 +1120,6 @@
     }
     if (SP.on) stopSpotify();
     
-    // FIX: Respect user's device preference. If `autoMute` is NOT active, user joins with mic UNMUTED!
-    // This allows other peers to instantly hear them upon joining.
     const p = prefs();
     const initialMic = !p.autoMute;
     
@@ -1131,7 +1127,7 @@
     S.call = {
       guildId: g.id, joinAt: now, mic: initialMic, cam: false, share: false,
       stream: null, display: null, hasMedia: false, shareWaiting: false,
-      peers: {}, shareMc: {}, soundMc: [], soundLocal: [], soundRemote: [], remote: {}, remoteShare: null, sharePending: {}
+      peers: {}, shareMc: {}, remote: {}, remoteShare: null, sharePending: {}
     };
     g.roster = g.roster || {};
     g.roster[S.user.id] = { name: S.user.name, color: S.user.color, mic: initialMic, cam: false, share: false, joinedAt: now };
@@ -1155,12 +1151,6 @@
     stopPresenceBeat();
     Object.keys(c.peers || {}).forEach(k => { try { c.peers[k].close(); } catch (e) {} });
     Object.keys(c.shareMc || {}).forEach(k => { try { c.shareMc[k].close(); } catch (e) {} });
-    (c.soundMc || []).forEach(mc => { try { mc.close(); } catch (e) {} });
-    (c.soundLocal || []).forEach(item => { try { item.audio.pause(); item.audio.src = ""; } catch (e) {} try { item.ctx.close(); } catch (e) {} });
-    (c.soundRemote || []).forEach(audio => { 
-      try { audio.pause(); audio.srcObject = null; } catch (e) {}
-      try { audio.remove(); } catch (e) {} 
-    });
     Object.keys(c.remote || {}).forEach(k => unwatchTalkLevel(k));
     if (peer && !peer.destroyed) { try { peer.destroy(); } catch (e) {} }
     peer = null; peerOpen = false; peerError = false;
@@ -1245,7 +1235,6 @@
       try { el.pause(); } catch (e) {}
       try { el.srcObject = null; } catch (e) {}
     });
-    Object.keys(soundWait).forEach(k => { clearTimeout(soundWait[k]); delete soundWait[k]; });
     const c = S.call;
     if (c) {
       Object.keys(c.remote || {}).forEach(uid => {
@@ -1257,12 +1246,6 @@
       if (c.remoteShare && c.remoteShare.stream) { try { c.remoteShare.stream.getTracks().forEach(t => t.stop()); } catch (e) {} }
       c.remoteShare = null;
       c.sharePending = {};
-      (c.soundRemote || []).forEach(a => {
-        try { a.pause(); } catch (e) {}
-        try { a.srcObject = null; } catch (e) {}
-        try { a.remove(); } catch (e) {}
-      });
-      c.soundRemote.length = 0;
     }
     clearTalkState();
     talkSent.state = false; talkSent.at = 0; talkSent.level = 0;
@@ -1312,29 +1295,7 @@
     const kind = mc.metadata && mc.metadata.kind ? mc.metadata.kind : "";
     const roster = (guilds()[c.guildId] || {}).roster || {};
     const haveMain = !!(c.peers[uid] && c.peers[uid].open);
-    if (kind === "sound") {
-      try { mc.answer(); } catch (e) {}
-      if (soundWait[uid]) { clearTimeout(soundWait[uid]); delete soundWait[uid]; }
-      const audio = document.createElement("audio");
-      audio.autoplay = true;
-      audio.playsInline = true;
-      audio.style.display = "none";
-      // FIX: Appending the dynamic remote audio element to the document fixes 
-      // browsers (like Safari) immediately suspending background / detached audio playback.
-      document.body.appendChild(audio); 
-      audio.srcObject = null;
-      c.soundRemote.push(audio);
-      mc.on("stream", s => { audio.srcObject = s; playMedia(audio); });
-      const remove = () => { 
-        const i = c.soundRemote.indexOf(audio); 
-        if (i !== -1) c.soundRemote.splice(i, 1); 
-        try { audio.pause(); audio.srcObject = null; } catch (e) {} 
-        try { audio.remove(); } catch (e) {} 
-      };
-      mc.on("close", remove);
-      mc.on("error", remove);
-      return;
-    }
+    
     const isShare = kind === "share" || (!kind && !!(roster[uid] && roster[uid].share) && haveMain);
     if (isShare) {
       try { mc.answer(); } catch (e) {}
@@ -1345,7 +1306,13 @@
         if (c.sharePending && roster[uid] && roster[uid].share) c.sharePending[uid] = true;
         updateStage();
       };
-      mc.on("stream", s => { c.remoteShare = { id: uid, stream: s }; if (c.sharePending) delete c.sharePending[uid]; updateStage(); });
+      mc.on("stream", s => { 
+        if (s.getVideoTracks().length > 0) {
+          c.remoteShare = { id: uid, stream: s }; 
+          if (c.sharePending) delete c.sharePending[uid]; 
+          updateStage(); 
+        }
+      });
       mc.on("close", drop);
       mc.on("error", drop);
       return;
@@ -1507,13 +1474,20 @@
     const main = byId("stage-main");
     const strip = byId("stage-strip");
     if (!main) return;
-    if (c.display && !hasLiveVideoTrack(c.display)) c.display = null;
-    if (c.remoteShare && !hasLiveVideoTrack(c.remoteShare.stream)) c.remoteShare = null;
-    const liveShare =
-      (c.display && hasLiveVideoTrack(c.display)) ||
-      (c.remoteShare && c.remoteShare.stream && hasLiveVideoTrack(c.remoteShare.stream));
+    
+    if (c.display && !hasLiveVideoTrack(c.display)) { c.display = null; c.share = false; }
+    if (c.remoteShare && (!c.remoteShare.stream || !hasLiveVideoTrack(c.remoteShare.stream))) c.remoteShare = null;
+    
+    const hasLiveShare = (c.display && hasLiveVideoTrack(c.display)) || (c.remoteShare && c.remoteShare.stream && hasLiveVideoTrack(c.remoteShare.stream));
+    const isPendingShare = Object.keys(c.sharePending || {}).length > 0;
+    
+    // FIX: Force music mode to be visible if it is on, and only override it 
+    // with "Waiting for presentation" if music is OFF.
+    const showShareTile = hasLiveShare || (isPendingShare && !SP.on);
+    
     const tiles = g.call.map(id => tileFor(id)).join("");
-    if (liveShare) {
+    
+    if (showShareTile) {
       main.classList.remove("music");
       main.classList.add("share");
       main.innerHTML = shareTile();
@@ -1864,6 +1838,7 @@
   const talkState = {};
   const talkSent = { state: false, at: 0, level: 0 };
   const tileEl = uid => document.querySelector('.tile[data-user-id="' + uid + '"]') || byId(uid === S.user.id ? "tile-self" : "tile-" + uid);
+  
   function resumeTalkContexts() {
     talkCtxs.forEach(ctx => { try { if (ctx.state === "suspended") ctx.resume(); } catch (e) {} });
   }
@@ -1985,79 +1960,30 @@
     } catch (e) { return null; }
   }
   function sbStopAllLocal() { _sbAudio.forEach(a => { try { a.pause(); a.src = ""; } catch (e) {} }); _sbAudio.length = 0; }
-  const soundWait = {};
+  
+  // FIX: WebRTC sound streams caused audio to be cut off the first second + overhead issues.
+  // Instead, it now instantly plays the audio dataURL locally while syncing the playback to 
+  // peers via a low-latency Realtime broadcast.
   function sbBroadcast(s) {
     if (!S.call || !s || !supabaseClient) return;
-    const rtc = playSoundboardToCall(s.dataUrl);
+    sbPlay(s.dataUrl); 
     const ch = getChannel(S.call.guildId);
     if (ch) {
-      try { ch.send({ type: "broadcast", event: "sb_play", payload: { id: s.id, name: s.name, emoji: s.emoji, dataUrl: s.dataUrl, player: S.user.id, rtc: !!rtc } }); } catch (e) {}
+      try { ch.send({ type: "broadcast", event: "sb_play", payload: { id: s.id, name: s.name, emoji: s.emoji, dataUrl: s.dataUrl, player: S.user.id } }); } catch (e) {}
     }
     const me = users()[S.user.id];
-    toast((s.emoji || "🔊") + " " + s.name + " — played by " + (me ? me.name : "someone"), "info");
+    toast((s.emoji || "🔊") + " " + s.name + " — played by " + (me ? me.name : "You"), "info");
   }
+
   function onSbPlay(p) {
     p = broadcastPayload(p);
     if (!S.call || !p) return;
     if (p.player && p.player === S.user.id) return;
-    if (p.rtc && p.dataUrl) {
-      if (soundWait[p.player]) clearTimeout(soundWait[p.player]);
-      soundWait[p.player] = setTimeout(() => {
-        delete soundWait[p.player];
-        sbPlay(p.dataUrl);
-      }, 900);
-    } else {
-      sbPlay(p.dataUrl);
-    }
+    sbPlay(p.dataUrl);
     const nm = displayName(p.player, null);
     toast((p.emoji || "🔊") + " " + (p.name || "sound") + " — played by " + (nm || "someone"), "info");
   }
 
-  function playSoundboardToCall(audioUrl) {
-    const c = S.call;
-    if (!c || !audioUrl || !peerOpen || !peer) { sbPlay(audioUrl); return false; }
-    try {
-      const audio = new Audio(audioUrl);
-      audio.crossOrigin = "anonymous";
-      audio.volume = SB.vol;
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const source = ctx.createMediaElementSource(audio);
-      const speakers = ctx.createGain();
-      const destination = ctx.createMediaStreamDestination();
-      source.connect(speakers);
-      speakers.connect(ctx.destination);
-      source.connect(destination);
-      const item = { audio, ctx };
-      c.soundLocal.push(item);
-      const finish = () => {
-        const i = c.soundLocal.indexOf(item);
-        if (i !== -1) c.soundLocal.splice(i, 1);
-        try { audio.pause(); audio.src = ""; } catch (e) {}
-        try { ctx.close(); } catch (e) {}
-        c.soundMc = (c.soundMc || []).filter(mc => calls.indexOf(mc) === -1);
-        calls.splice(0).forEach(mc => { try { mc.close(); } catch (e) {} });
-      };
-      audio.addEventListener("ended", finish, { once: true });
-      const calls = [];
-      const roster = (guilds()[c.guildId] || {}).call || [];
-      roster.forEach(uid => {
-        if (uid === S.user.id) return;
-        try {
-          const mc = peer.call(uid, destination.stream, { metadata: { kind: "sound" } });
-          calls.push(mc);
-          mc.on("close", () => { const i = calls.indexOf(mc); if (i !== -1) calls.splice(i, 1); });
-          mc.on("error", () => { try { mc.close(); } catch (e) {} });
-        } catch (e) {}
-      });
-      c.soundMc.push(...calls);
-      if (ctx.state === "suspended") { try { const pr = ctx.resume(); if (pr && pr.catch) pr.catch(() => {}); } catch (e) {} }
-      audio.play().catch(() => {});
-      return calls.length > 0;
-    } catch (e) {
-      sbPlay(audioUrl);
-      return false;
-    }
-  }
   function onSoundboardRealtime(payload) {
     if (!S.call) return;
     const gid = S.call.guildId;
@@ -2070,6 +1996,10 @@
       } else if (e === "DELETE") {
         const id = payload.old ? payload.old.id : null;
         DB.soundboards[gid] = rows.filter(x => x.id !== id);
+      } else if (e === "UPDATE") {
+        const r = payload.new;
+        const idx = rows.findIndex(x => x.id === r.id);
+        if (idx !== -1) rows[idx].name = r.name;
       }
     } catch (err) {}
     renderSoundboard();
@@ -2100,6 +2030,7 @@
         '<span class="sb-by">by ' + esc(owner ? owner.name : "someone") + "</span></span>" +
         '<button class="sb-act" data-play="' + s.id + '" title="Play to the call">' + ic("sound", 15) + "</button>" +
         '<button class="sb-act" data-self="' + s.id + '" title="Preview for you">' + ic("headphone", 15) + "</button>" +
+        (mine ? '<button class="sb-act sb-edit" data-edit="' + s.id + '" title="Rename">' + ic("edit", 15) + "</button>" : "") +
         (mine ? '<button class="sb-act sb-del" data-del="' + s.id + '" title="Remove">' + ic("trash", 15) + "</button>" : "") +
       "</div>";
     }).join("") : '<div class="sb-empty">No sounds in this call yet.<br><b>+ Add</b> one to share it with everyone.</div>';
@@ -2131,7 +2062,31 @@
     });
     $$("[data-play]", panel).forEach(b => b.addEventListener("click", () => { const s = find(b.dataset.play); if (s) sbBroadcast(s); }));
     $$("[data-self]", panel).forEach(b => b.addEventListener("click", () => { const s = find(b.dataset.self); if (s) sbPlay(s.dataUrl); }));
+    $$("[data-edit]", panel).forEach(b => b.addEventListener("click", () => { const s = find(b.dataset.edit); if (s) renameSoundModal(s); }));
     $$("[data-del]", panel).forEach(b => b.addEventListener("click", () => { const s = find(b.dataset.del); if (s) sbDelete(s); }));
+  }
+  function renameSoundModal(s) {
+    showModal(
+      '<div class="modal" style="width:400px;">' +
+        '<div class="modal-head"><h3>' + ic("edit", 17) + ' Rename sound</h3><button class="modal-x" data-close>' + ic("x", 16) + '</button></div>' +
+        '<div class="modal-body">' +
+          '<div class="field"><label>New Name</label><input id="sb-rename-in" type="text" maxlength="32" value="' + esc(s.name) + '" autocomplete="off"></div>' +
+        '</div>' +
+        '<div class="modal-foot"><button class="btn btn-ghost" data-close>Cancel</button><button class="btn btn-primary" id="sb-rename-save" style="width:auto;">Save</button></div>' +
+      '</div>'
+    );
+    byId("sb-rename-save").addEventListener("click", async () => {
+      const newName = (byId("sb-rename-in").value || "").trim();
+      if (!newName) return toast("Name cannot be empty.", "err");
+      if (supabaseClient) {
+        const { error } = await supabaseClient.from("soundboard").update({ name: newName }).eq("id", s.id).eq("server_id", S.call.guildId);
+        if (error) return toast("Rename failed: " + error.message, "err");
+      }
+      s.name = newName;
+      renderSoundboard();
+      closeModal();
+      toast("Sound renamed to " + newName + ".", "ok");
+    });
   }
   function sbDelete(s) {
     if (!s || s.addedBy !== S.user.id || !supabaseClient) return;
@@ -3082,4 +3037,363 @@
           '<div class="sp-bg-layer a" id="sp-bg-a"></div>' +
           '<div class="sp-bg-layer b" id="sp-bg-b"></div>' +
         '</div>' +
-        '<
+        '<div class="sp-top-bar" id="sp-top-bar">' +
+          '<div class="sp-search-bar" id="sp-search-bar">' +
+            '<span class="sp-search-icon">' + ic("search", 16) + '</span>' +
+            '<input type="text" id="sp-stage-search-in" placeholder="Search YouTube songs, artists, or paste a YouTube / SoundCloud link..." autocomplete="off" />' +
+            '<button class="sp-search-btn" id="sp-stage-search-btn" title="Search YouTube">Search</button>' +
+            '<button class="sp-key-btn" id="sp-key-btn" title="YouTube Data API v3 Key (optional)">' + ic("gear", 15) + '</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="sp-carousel" id="sp-carousel"><div class="sp-lane" id="sp-lane">' +
+          [-2, -1, 0, 1, 2].map(o => '<div class="sp-card" data-o="' + o + '"><div class="sp-card-art"></div><div class="sp-card-meta"><div class="sp-card-title"></div><div class="sp-card-artist"></div></div></div>').join("") +
+        "</div></div>" +
+        '<div class="sp-dock-wrap">' +
+          '<div class="sp-dock" id="sp-dock">' +
+            '<div class="sp-dock-left">' +
+              '<button class="sp-icon-btn" id="sp-prev" title="Previous track">' + ic("spPrev", 20) + "</button>" +
+              '<button class="sp-icon-btn sp-btn-play" id="sp-play" title="Play / Pause">' + ic(SP.playing ? "spPause" : "spPlay", 22) + "</button>" +
+              '<button class="sp-icon-btn" id="sp-next" title="Next track">' + ic("spNext", 20) + "</button>" +
+            "</div>" +
+            '<div class="sp-mini" id="sp-mini">' +
+              '<div class="sp-mini-art" id="sp-mini-art">' +
+                '<div class="sp-mini-prog"><div class="sp-mini-prog-fill" id="sp-prog-fill"></div></div>' +
+              "</div>" +
+              '<div class="sp-mini-info">' +
+                '<div class="sp-mini-title" id="sp-mini-title">Nothing queued</div>' +
+                '<div class="sp-mini-artist" id="sp-mini-artist">Search a track to begin</div>' +
+              "</div>" +
+              '<div class="sp-mini-eq ' + (SP.playing ? "playing" : "") + '" id="sp-mini-eq" title="Audio equalizer">' +
+                "<span></span><span></span><span></span><span></span>" +
+              "</div>" +
+              '<button class="sp-icon-btn sp-mini-more" id="sp-mini-more" title="Track options">' + ic("ellipsis", 18) + "</button>" +
+            "</div>" +
+            '<div class="sp-dock-right">' +
+              (hosting ? '<button class="sp-icon-btn ' + (SP.restrict ? "on" : "") + '" id="sp-restrict" title="' + (SP.restrict ? "Only host can control (click to unlock)" : "Anyone can control (click to lock)") + '">' + ic(SP.restrict ? "lock" : "unlock", 16) + "</button>" : "") +
+              '<button class="sp-icon-btn ' + (SP.openPanel === "lyrics" ? "active" : "") + '" id="sp-lyrics" title="Lyrics">' + ic("spLyrics", 20) + "</button>" +
+              '<button class="sp-icon-btn ' + (SP.openPanel === "queue" ? "active" : "") + '" id="sp-queue-btn" title="Queue & YouTube Search">' + ic("spQueue", 20) + "</button>" +
+              '<button class="sp-icon-btn ' + (SP.openPanel === "logs" ? "active" : "") + '" id="sp-logs-btn" title="Playback Logs">' + ic("spLogs", 20) + "</button>" +
+              '<div class="sp-vol-wrap">' +
+                '<button class="sp-icon-btn" id="sp-vol-btn" title="Volume">' + ic("spVolume", 20) + "</button>" +
+                '<div class="sp-vol-pop"><input id="sp-vol" type="range" min="0" max="1" step="0.02" value="' + SP.volume + '"></div>' +
+              "</div>" +
+            "</div>" +
+          "</div>" +
+        "</div>" +
+        '<div class="sp-panel" id="sp-panel-queue"></div>' +
+        '<div class="sp-panel" id="sp-panel-lyrics"></div>' +
+        '<div class="sp-panel" id="sp-panel-logs"></div>' +
+      "</div>";
+    wireMusic();
+    updateCarousel();
+    updateDynamicBackground(curTrack(), true);
+    updateDock();
+    refreshPanels();
+  }
+
+  function wireMusic() {
+    const hid = (id, fn) => { const el = byId(id); if (el) el.addEventListener("click", fn); };
+    hid("sp-prev", () => prevTrack());
+    hid("sp-play", () => togglePlay());
+    hid("sp-next", () => nextTrack({}));
+    hid("sp-lyrics", () => togglePanel("lyrics"));
+    hid("sp-queue-btn", () => togglePanel("queue"));
+    hid("sp-logs-btn", () => togglePanel("logs"));
+    hid("sp-restrict", toggleRestrict);
+    hid("sp-mini-more", () => { const t = curTrack(); if (t) toast(t.title + " by " + t.artist, "info"); });
+    const vol = byId("sp-vol");
+    if (vol) vol.addEventListener("input", () => {
+      SP.volume = Math.max(0, Math.min(1, parseFloat(vol.value) || 0));
+      if (audioEl) { try { audioEl.volume = SP.volume; } catch(e){} }
+      if (ytPlayer && ytPlayerReady) { try { ytPlayer.setVolume(Math.round(SP.volume * 100)); } catch(e){} }
+      syncSpotify();
+    });
+
+    const sIn = byId("sp-stage-search-in");
+    const sBtn = byId("sp-stage-search-btn");
+    const openWithQuery = q => {
+      SP.openPanel = "queue";
+      SP.panelTab = "search";
+      refreshPanels();
+      updateDock();
+      if (q && q.trim()) {
+        const panelIn = byId("sp-search-in");
+        if (panelIn) { panelIn.value = q.trim(); const panelGo = byId("sp-search-go"); if (panelGo) panelGo.click(); }
+      }
+    };
+    if (sBtn) sBtn.addEventListener("click", () => openWithQuery(sIn ? sIn.value : ""));
+    if (sIn) sIn.addEventListener("keydown", e => { if (e.key === "Enter") openWithQuery(sIn.value); });
+    hid("sp-key-btn", () => ytApiKeyModal());
+  }
+
+  function updateCarousel() {
+    const lan = byId("sp-lane");
+    if (!lan) return;
+    const cards = lan.children || [];
+    for (let i = 0; i < cards.length; i++) {
+      const o = i - 2;
+      const card = cards[i];
+      if (!card) continue;
+      const ti = SP.index + o;
+      const t = SP.queue[ti];
+      card.dataset.o = o;
+      card.classList.toggle("active", o === 0);
+      card.classList.toggle("clickable", !!(o && t));
+      if (o && t) card.onclick = () => slideTo(o); else card.onclick = null;
+      if (t) {
+        card.style.display = "";
+        const art = card.querySelector(".sp-card-art");
+        if (art) {
+          if (t.source === "sc" && o === 0) {
+            art.style.backgroundImage = "";
+            const src = soundcloudEmbedUrl(t, SP.playing);
+            let scEmbed = art.querySelector("iframe.sp-sc-embed");
+            if (!scEmbed) {
+              art.innerHTML = '<iframe class="sp-sc-embed" src="' + src + '" width="100%" height="100%" frameborder="no" scrolling="no" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen title="SoundCloud player"></iframe>';
+            } else if (scEmbed.getAttribute("src") !== src) {
+              scEmbed.setAttribute("src", src);
+            }
+          } else {
+            art.style.backgroundImage = artCSS(t);
+            const scEmbed = art.querySelector("iframe.sp-sc-embed");
+            if (scEmbed) scEmbed.remove();
+          }
+        }
+        const tt = card.querySelector(".sp-card-title");
+        if (tt) tt.textContent = t.title;
+        const at = card.querySelector(".sp-card-artist");
+        if (at) at.textContent = t.artist;
+      } else {
+        card.style.display = "none";
+      }
+    }
+  }
+
+  function updateDock() {
+    const play = byId("sp-play");
+    if (play) play.innerHTML = ic(SP.playing ? "spPause" : "spPlay", 22);
+    const can = canControl();
+    [byId("sp-prev"), byId("sp-next"), play].forEach(el => { if (el) el.disabled = !can; });
+    const rst = byId("sp-restrict");
+    if (rst) rst.classList.toggle("on", !!SP.restrict);
+    const vol = byId("sp-vol"); if (vol) vol.value = String(SP.volume);
+    const t = curTrack();
+    const ma = byId("sp-mini-art");
+    if (ma) {
+      const artUrl = t ? (t.thumbUrl || t.artUrl) : "";
+      ma.style.backgroundImage = artUrl ? 'url("' + artUrl + '")' : (t ? artCSS(t) : "");
+    }
+    const mt = byId("sp-mini-title"), ms = byId("sp-mini-artist");
+    if (mt) mt.textContent = t ? t.title : "Nothing queued";
+    if (ms) ms.textContent = t ? t.artist : "Select a track";
+    const eq = byId("sp-mini-eq");
+    if (eq) eq.classList.toggle("playing", !!SP.playing);
+    const lyr = byId("sp-lyrics");
+    if (lyr) lyr.classList.toggle("active", SP.openPanel === "lyrics");
+    const qbtn = byId("sp-queue-btn");
+    if (qbtn) qbtn.classList.toggle("active", SP.openPanel === "queue");
+    const lgbtn = byId("sp-logs-btn");
+    if (lgbtn) lgbtn.classList.toggle("active", SP.openPanel === "logs");
+    refreshProgress();
+  }
+
+  function refreshProgress() {
+    const t = curTrack();
+    const dur = (t && t.dur) ? t.dur : 200000;
+    const pb = byId("sp-prog-fill");
+    if (pb) pb.style.width = (dur ? Math.min(100, (SP.pos / dur) * 100) : 0) + "%";
+  }
+
+  function decodeHTMLEntities(str) {
+    if (!str) return "";
+    const p = document.createElement("textarea");
+    p.innerHTML = str;
+    return p.value;
+  }
+
+  function getYtApiKey() { return localStorage.getItem("hc_yt_api_key") || ""; }
+  function setYtApiKey(k) {
+    if (k && k.trim()) localStorage.setItem("hc_yt_api_key", k.trim());
+    else localStorage.removeItem("hc_yt_api_key");
+  }
+
+  function ytApiKeyModal() {
+    const current = getYtApiKey();
+    showModal(
+      '<h2>YouTube Data API v3 Key</h2>' +
+      '<p class="sub">Optional: enter a YouTube Data API v3 key to search embeddable videos from YouTube\'s official index.</p>' +
+      '<div class="f-group" style="margin-top:16px;">' +
+        '<label class="f-label">API Key</label>' +
+        '<input type="text" class="f-input" id="yt-key-in" placeholder="AIzaSy..." value="' + esc(current) + '" style="width:100%;background:var(--bg-2);border:1px solid var(--line-2);color:var(--tx);border-radius:8px;padding:10px 12px;outline:none;" />' +
+      '</div>' +
+      '<div style="font-size:12px;color:var(--tx-3);margin:12px 0 16px;line-height:1.5;">Leave blank to use the public Invidious / Piped search, with automatic YouTube IFrame fallback.</div>' +
+      '<div class="modal-acts" style="display:flex;gap:8px;justify-content:flex-end;">' +
+        (current ? '<button class="btn btn-ghost btn-sm" id="yt-key-clear">Clear Key</button>' : '') +
+        '<button class="btn btn-primary btn-sm" id="yt-key-save">Save</button>' +
+      '</div>'
+    );
+    const saveBtn = byId("yt-key-save");
+    if (saveBtn) saveBtn.addEventListener("click", () => {
+      setYtApiKey((byId("yt-key-in").value || "").trim());
+      closeModal();
+      toast("Saved.", "ok");
+    });
+    const clrBtn = byId("yt-key-clear");
+    if (clrBtn) clrBtn.addEventListener("click", () => { setYtApiKey(""); closeModal(); toast("Cleared.", "info"); });
+  }
+
+  function extractYouTubeId(url) {
+    if (!url) return null;
+    const str = url.trim();
+    if (/^[\w-]{11}$/.test(str)) return str;
+    const m = str.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})/i);
+    return m ? m[1] : null;
+  }
+
+  async function searchYouTube(query) {
+    query = (query || "").trim();
+    if (!query) return [];
+    const term = query + " Audio";
+    const directId = extractYouTubeId(query);
+    if (directId) {
+      let title = "YouTube Video", artist = "YouTube Audio";
+      try {
+        const nr = await fetch("https://noembed.com/embed?url=https://www.youtube.com/watch?v=" + directId);
+        const nj = await nr.json();
+        if (nj.title) title = nj.title;
+        if (nj.author_name) artist = nj.author_name;
+      } catch (e) {}
+      return [{
+        id: "yt_" + directId, ytId: directId, title, artist, album: "YouTube", dur: 210000,
+        artUrl: "https://img.youtube.com/vi/" + directId + "/hqdefault.jpg",
+        thumbUrl: "https://img.youtube.com/vi/" + directId + "/mqdefault.jpg"
+      }];
+    }
+
+    let results = null;
+    const apiKey = getYtApiKey();
+    if (apiKey) {
+      try {
+        const url = "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&videoSyndicated=true&maxResults=12&q=" + encodeURIComponent(term) + "&key=" + apiKey;
+        const res = await fetch(url);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.items && data.items.length) {
+            results = data.items.map(item => {
+              const vid = item.id && item.id.videoId;
+              if (!vid) return null;
+              const snip = item.snippet || {};
+              const highThumb = snip.thumbnails && snip.thumbnails.high ? snip.thumbnails.high.url : ("https://img.youtube.com/vi/" + vid + "/hqdefault.jpg");
+              const medThumb = snip.thumbnails && snip.thumbnails.medium ? snip.thumbnails.medium.url : ("https://img.youtube.com/vi/" + vid + "/mqdefault.jpg");
+              return {
+                id: "yt_" + vid, ytId: vid,
+                title: decodeHTMLEntities(snip.title || "Unknown Title"),
+                artist: decodeHTMLEntities(snip.channelTitle || "YouTube"),
+                album: "YouTube", dur: 210000, artUrl: highThumb, thumbUrl: medThumb
+              };
+            }).filter(Boolean);
+          }
+        }
+      } catch (e) {}
+    }
+
+    if (!results || !results.length) {
+      const endpoints = INVIDIOUS_INSTANCES.map(base => base + "/api/v1/search?q=" + encodeURIComponent(term) + "&type=video")
+        .concat(PIPED_INSTANCES.map(base => base + "/search?q=" + encodeURIComponent(term) + "&filter=videos"));
+      for (const ep of endpoints) {
+        try {
+          const ctrl = new AbortController();
+          const tid = setTimeout(() => ctrl.abort(), 3500);
+          const res = await fetch(ep, { signal: ctrl.signal });
+          clearTimeout(tid);
+          if (res.ok) {
+            const j = await res.json();
+            const list = Array.isArray(j) ? j : (j.items || []);
+            if (list && list.length) {
+              results = list.slice(0, 10).map(item => {
+                const vid = item.videoId || (item.url ? extractYouTubeId(item.url) : null);
+                if (!vid) return null;
+                const title = item.title || "Unknown Title";
+                if (/VEVO/i.test(title)) return null;
+                const author = item.author || item.uploaderName || "YouTube";
+                const thumb = item.videoThumbnails ? ((item.videoThumbnails.find(x => x.quality === "high") || {}).url || ("https://img.youtube.com/vi/" + vid + "/hqdefault.jpg")) : ("https://img.youtube.com/vi/" + vid + "/hqdefault.jpg");
+                return {
+                  id: "yt_" + vid, ytId: vid, title, artist: author, album: "YouTube",
+                  dur: (item.lengthSeconds ? item.lengthSeconds * 1000 : 210000),
+                  artUrl: thumb, thumbUrl: "https://img.youtube.com/vi/" + vid + "/mqdefault.jpg"
+                };
+              }).filter(Boolean);
+            }
+          }
+        } catch (e) {}
+        if (results && results.length) break;
+      }
+    }
+
+    return results && results.length ? results : [];
+  }
+
+  const AUDIO_EXT_RE = /\.(mp3|aac|wav|m4a|flac|ogg|oga|opus|aiff|webm)([?#].*)?$/i;
+  function detectDirectAudio(input) {
+    const raw = (input || "").trim();
+    if (!/^https?:\/\//i.test(raw)) return false;
+    if (extractYouTubeId(raw)) return false;
+    return AUDIO_EXT_RE.test(raw);
+  }
+  function buildAudioTrack(url) {
+    const raw = (url || "").trim();
+    const fname = decodeURIComponent(((raw.split("?")[0] || "").split("#")[0] || "").split("/").pop()) || "";
+    const title = fname.replace(/\.(mp3|aac|wav|m4a|flac|ogg|oga|opus|aiff|webm)$/i, "").replace(/[-_+]+/g, " ").replace(/\s+/g, " ").trim() || "Direct Stream";
+    return {
+      id: "au_" + Math.random().toString(36).slice(2, 10),
+      source: "audio", url: raw, title, artist: "Direct Audio", album: "Stream", dur: 0,
+      artUrl: "", thumbUrl: "", embeddable: true
+    };
+  }
+  function parseSoundCloudUrl(input) {
+    const raw = (input || "").trim();
+    if (!raw) return null;
+    let m = raw.match(/^https?:\/\/(?:www\.|app\.|m\.|api\.)?soundcloud\.com\/([^\/?#]+)\/(?:sets\/)?([^\/?#]+)/i);
+    if (m) {
+      const artist = decodeURIComponent(m[1].trim());
+      if (/^(search|people|you|popular|charts|stream|upload|settings|discover|creators|signin|forgot-password|notifications|messages)$/i.test(artist)) return null;
+      let slug = m[2].trim();
+      if (/^https?:\/\//i.test(slug)) return null;
+      return { artist, slug: decodeURIComponent(slug.replace(/\/+$/, "")), url: raw.replace(/[?#].*$/, "").replace(/\/$/, ""), type: /\/sets\//i.test(raw) ? "set" : "track" };
+    }
+    return null;
+  }
+  const humanizeSlug = s => (s || "").replace(/[-_+]+/g, " ").replace(/\b\w/g, c => c.toUpperCase()).trim();
+  async function resolveSoundCloudUrl(inputUrl) {
+    const m = parseSoundCloudUrl(inputUrl);
+    if (!m) return null;
+    const track = {
+      id: "sc_" + m.artist + "_" + m.slug, source: "sc", scUrl: m.url, scType: m.type || "track",
+      title: humanizeSlug(m.slug), artist: humanizeSlug(m.artist), album: "SoundCloud",
+      dur: 210000, artUrl: "", thumbUrl: "", embeddable: true, oembedOk: false
+    };
+    try {
+      const ctrl = new AbortController();
+      const tid = setTimeout(() => ctrl.abort(), 5000);
+      const res = await fetch("https://soundcloud.com/oembed?url=" + encodeURIComponent(m.url) + "&format=json", { signal: ctrl.signal });
+      clearTimeout(tid);
+      if (res.ok) {
+        const o = await res.json();
+        if (o.title) track.title = o.title;
+        if (o.author_name) track.artist = o.author_name;
+        if (o.thumbnail_url) {
+          track.thumbUrl = o.thumbnail_url;
+          const hi = o.thumbnail_url.replace(/-(?:t\d+x\d+|large|small|crop)\.jpg$/i, "-t500x500.jpg");
+          track.artUrl = /\.jpg$/i.test(hi) ? hi : o.thumbnail_url;
+        }
+        track.oembedOk = true;
+      }
+    } catch (e) {}
+    return track;
+  }
+
+  function queuePanelHTML() {
+    const tab = SP.panelTab || "search";
+    let h = '<div class="tabs-inline" style="margin-bottom:12px;">' +
+      '<button class="tab-inline ' + (tab === "search" ? "active" : "") + '" data-qtab="search">Search</button>' +
+      '<button class="tab-inline ' + (tab ===
