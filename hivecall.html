@@ -693,7 +693,10 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     g.roster = roster;
     // Anyone who is no longer in the call loses their green speaking ring too.
     Object.keys(talkState).forEach(uid => { if (!roster[uid]) clearTalkState(uid); });
-    if (music && music.queue) S.callMusic = music;
+    if (S.call && S.call.guildId === g.id) {
+      S.callMusic = validMusicSession(music, g.id) ? music : null;
+      if (!S.callMusic && SP.on && SP.hostId !== S.user.id) stopSpotify();
+    }
     if (origin === "rt" && S.call && S.call.guildId === g.id) {
       g.call.filter(id => !prevCall.includes(id) && id !== S.user.id).forEach(id => {
         toast(displayName(id, roster[id] && roster[id].name) + " joined the call.", "info");
@@ -718,7 +721,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       }
     }
     if (origin !== "local" && S.call && S.call.guildId === g.id) {
-      if (music && music.queue && SP.on) applySpotifySync(music);
+      if (S.callMusic && SP.on) applySpotifySync(S.callMusic);
       // Dial users we aren't connected to yet (lower-id initiates to avoid double-dials).
       if (peerOpen && S.call && S.call.guildId === g.id) {
         g.call.forEach(id => { if (id !== S.user.id && S.user.id < id) callUser(id); });
@@ -765,6 +768,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
           // A prior build persisted sound-board state under this reserved key.
           // It is not a participant and is removed on the next normal presence write.
           delete obj._soundboard;
+          if (obj._music && patch[obj._music.hostId] === null) delete obj._music;
           Object.keys(patch).forEach(k => { if (patch[k] === null) delete obj[k]; else obj[k] = patch[k]; });
           if (data) await supabaseClient.from("call_presence").update({ active_users: obj }).eq("server_id", gid);
           else await supabaseClient.from("call_presence").insert({ server_id: gid, active_users: obj });
@@ -857,10 +861,16 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     });
   }
   function pushMusic() {
-    const c = S.call; if (!c || !S.user) return;
+    const c = S.call; if (!c || !S.user || !SP.on || !canControl()) return;
+    musicLastPush = Date.now();
+    const track = curTrack();
+    const active = !!(track && (track.source === "audio" ? audioEl && !audioEl.paused && audioReady
+      : track.source === "sc" ? scActuallyPlaying
+      : ytPlayer && ytPlayerReady && ytLoadedId === track.ytId && ytPlayer.getPlayerState() === 1));
     writePresence(c.guildId, {
-      _music: { hostId: SP.hostId, restrict: SP.restrict, index: SP.index, queue: SP.queue, playing: SP.playing, pos: SP.pos, t0: Date.now(), volume: SP.volume }
+      _music: { hostId: SP.hostId, restrict: SP.restrict, index: SP.index, queue: SP.queue, playing: SP.playing, active, pos: SP.pos, t0: Date.now(), volume: SP.volume, senderId: S.user.id }
     });
+    broadcastMusicInvite();
   }
 
   /* Real-time channels: messages, call_presence, soundboard + broadcast. */
@@ -1787,7 +1797,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     let next = bak;
     try { next = JSON.parse(JSON.stringify(bak)); } catch (e) { return; }
     delete next[S.user.id];
-    if (next._music && S.callMusic && S.callMusic.hostId === S.user.id) delete next._music;
+    if (next._music && next._music.hostId === S.user.id) delete next._music;
     const url = SUPABASE_URL.replace(/\/+$/, "") + "/rest/v1/call_presence";
     let body;
     try { body = JSON.stringify({ server_id: gid, active_users: next }); } catch (e) { return; }
@@ -3292,6 +3302,8 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   let ytPlayerReady = false;
   let ytApiPromise = null;
   let ytReadyTimer = null;
+  let ytPending = null;
+  let ytGeneration = 0;
   let ytLoadedId = null;                       // video id currently loaded in the IFrame player
   const ytFailMemory = {};                     // ytId -> timestamp of last failed embed
   const YT_RETRY_COOLDOWN_MS = 60 * 1000;      // don't re-attempt a failed embed for 60s
@@ -3315,7 +3327,15 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     return ytApiPromise;
   }
 
-  async function playViaYouTubeIframe(ytId, autoplay) {
+  function playViaYouTubeIframe(ytId, autoplay) {
+    if (ytPending && ytPending.id === ytId) return ytPending.promise;
+    const generation = ++ytGeneration;
+    const promise = buildYouTubeIframe(ytId, autoplay, generation);
+    ytPending = { id: ytId, promise };
+    promise.finally(() => { if (ytPending && ytPending.promise === promise) ytPending = null; });
+    return promise;
+  }
+  async function buildYouTubeIframe(ytId, autoplay, generation) {
     // Same video already loaded on a ready player? Never rebuild it — just
     // match the requested play state. Tearing down and recreating the player
     // on every repeat call (sync/presence echo) is what made tracks restart
@@ -3334,6 +3354,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     try { await loadYouTubeIframeAPI(); }
     catch (e) { logPlayer("error", "Failed to load YouTube IFrame API: " + e.message); return false; }
 
+    if (generation !== ytGeneration || !SP.on) return true;
     const host = document.getElementById("yt-host");
     if (!host) { logPlayer("error", "yt-host container missing"); return false; }
     if (ytPlayer && ytPlayer.destroy) { try { ytPlayer.destroy(); } catch(e){} ytPlayer = null; }
@@ -3354,15 +3375,18 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
           },
           events: {
             onReady: (e) => {
+              if (generation !== ytGeneration || !SP.on) { done(true); return; }
               ytPlayerReady = true;
               ytLoadedId = ytId;
               if (ytReadyTimer) { clearTimeout(ytReadyTimer); ytReadyTimer = null; }
               try { e.target.setVolume(Math.round(SP.volume * 100)); } catch(err){}
               if (autoplay) { try { e.target.playVideo(); } catch(err){} }
+              alignMusicPlayback();
               logPlayer("info", "YouTube IFrame ready for " + ytId);
               done(true);
             },
             onStateChange: (e) => {
+              if (generation !== ytGeneration || !SP.on) return;
               // 0 ended, 1 playing, 2 paused, 3 buffering, 5 cued
               if (e.data === 0 && SP.on) nextTrack({ auto: true });
               if (e.data === 1) { SP.playing = true; updateDock(); }
@@ -3384,6 +3408,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   }
 
   function destroyYouTubePlayer() {
+    ytGeneration++; ytPending = null;
     if (ytReadyTimer) { clearTimeout(ytReadyTimer); ytReadyTimer = null; }
     if (ytPlayer && ytPlayer.destroy) { try { ytPlayer.destroy(); } catch(e){} }
     ytPlayer = null;
@@ -3408,6 +3433,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     audioEl.style.cssText = "position:fixed;width:0;height:0;left:-9999px;top:-9999px;";
     audioEl.addEventListener("loadedmetadata", () => {
       audioReady = true;
+      alignMusicPlayback();
       const t = curTrack();
       if (t && t.source === "audio" && audioEl.duration && isFinite(audioEl.duration)) {
         const d = audioEl.duration * 1000;
@@ -3527,8 +3553,12 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       scWidget = window.SC.Widget(w);
       scWidget.bind("READY", () => {
         scWidgetReady = true;
+        alignMusicPlayback();
         if (scBaseUrl) { try { scWidget.load(scBaseUrl, { auto_play: SP.playing }); } catch (e) {} }
       });
+      scWidget.bind("PLAY", () => { scActuallyPlaying = true; });
+      scWidget.bind("PAUSE", () => { scActuallyPlaying = false; });
+      scWidget.bind("PLAY_PROGRESS", e => { if (SP.on) SP.pos = e.currentPosition; });
       scWidget.bind("FINISH", () => { if (SP.on) nextTrack({ auto: true }); });
       scWidget.bind("ERROR", () => { toast("That SoundCloud track was blocked and skipped.", "err"); if (SP.on) nextTrack({ auto: true }); });
     } catch (e) {}
@@ -3554,6 +3584,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     try { if (on) scWidget.play(); else scWidget.pause(); } catch (e) {}
   }
   function pauseSoundCloud() {
+    scActuallyPlaying = false;
     if (scWidget && scWidgetReady) { try { scWidget.pause(); } catch (e) {} }
     scBaseUrl = "";
   }
@@ -3577,35 +3608,65 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   }
 
   /* ---------- session sync ---------- */
-  function syncSpotify() { if (S.call) pushMusic(); }
-  function applySpotifySync(p) {
-    if (!p || typeof p !== "object" || !SP.on || !S.call) return;
-    if (Array.isArray(p.queue) && p.queue.length) {
-      SP.queue = p.queue;
-      SP.index = Math.max(0, Math.min(p.index || 0, p.queue.length - 1));
-      p.queue.forEach(t => { TRACK_INDEX[t.id] = t; });
-    }
-    SP.restrict = !!p.restrict;
-    if (p.hostId) SP.hostId = p.hostId;
-    SP.volume = Math.max(0, Math.min(1, typeof p.volume === "number" ? p.volume : SP.volume));
-    SP.playing = !!p.playing; SP.pos = p.pos || 0;
+  function syncSpotify() { musicSyncState = null; if (S.call) pushMusic(); }
+  let musicLastPush = 0;
+  let musicInviteKey = "";
+  let scActuallyPlaying = false;
+  let musicSyncState = null;
+  let musicSyncKey = "";
+  function validMusicSession(p, gid, active = false) {
+    if (!p || !p.hostId || !Array.isArray(p.queue) || !Number.isInteger(p.index)) return false;
+    const t = p.queue[p.index];
+    const roster = (guilds()[gid] || {}).roster || {};
+    return !!(roster[p.hostId] && t && (/^[a-zA-Z0-9_-]{11}$/.test(t.ytId || "") || (t.source === "audio" && /^https?:\/\//.test(t.url || "")) ||
+      (t.source === "sc" && /^https:\/\/(www\.)?soundcloud\.com\//.test(t.scUrl || ""))) && (!active || (p.playing === true && p.active !== false)));
+  }
+  function musicPosition(p) {
+    return Math.max(0, Number(p.pos) || 0) + (p.playing ? Math.max(0, Date.now() - (Number(p.t0) || Date.now())) : 0);
+  }
+  function alignMusicPlayback() {
+    const p = musicSyncState;
+    if (!SP.on || !p) return;
     const t = curTrack();
-    if (t) {
+    if (!t) return;
+    const pos = musicPosition(p);
+    SP.pos = pos;
+    if (t.ytId && ytPlayer && ytPlayerReady && ytLoadedId === t.ytId) {
+      if (Math.abs((ytPlayer.getCurrentTime() || 0) * 1000 - pos) > 1500) ytPlayer.seekTo(pos / 1000, true);
+      if (p.playing) ytPlayer.playVideo(); else ytPlayer.pauseVideo();
+    } else if (t.source === "audio" && audioReady && audioEl) {
+      if (Math.abs(audioEl.currentTime * 1000 - pos) > 1500) seekAudio(pos / 1000);
+      if (audioEl.paused === !!p.playing) setAudioPlaying(!!p.playing);
+    } else if (t.source === "sc" && scWidgetReady && scWidget) {
+      scWidget.seekTo(pos);
+      setSoundCloudPlaying(!!p.playing);
+    }
+  }
+  function applySpotifySync(p, force = false) {
+    if (!SP.on || !S.call || !validMusicSession(p, S.call.guildId)) return;
+    const key = JSON.stringify(p);
+    if (!force && (key === musicSyncKey || p.senderId === S.user.id)) return;
+    musicSyncKey = key;
+    const old = curTrack();
+    const next = p.queue[p.index];
+    const same = old && (old.ytId || old.scUrl || old.url || old.id) === (next.ytId || next.scUrl || next.url || next.id);
+    // Keep this device's resolved media source; another participant's resolver may differ.
+    SP.queue = p.queue.map((t, i) => same && i === p.index ? Object.assign({}, t, { source: old.source, url: old.url, audUrls: old.audUrls }) : Object.assign({}, t));
+    SP.index = p.index;
+    SP.queue.forEach(t => { TRACK_INDEX[t.id] = t; });
+    SP.hostId = p.hostId; SP.restrict = !!p.restrict;
+    SP.playing = !!p.playing;
+    musicSyncState = p;
+    const t = curTrack();
+    if (!same || force) {
+      pauseAudio(); pauseSoundCloud();
+      if (ytPlayer && ytPlayerReady) ytPlayer.pauseVideo();
       if (t.source === "audio" && t.url) playAudioTrack(t, SP.playing);
       else if (t.source === "sc" && t.scUrl) loadSoundCloudTrack(t, SP.playing);
-      else if (t.source === "ytiframe" && t.ytId) {
-        // Same video already live on the IFrame player? Only match play/pause —
-        // reloading here on every presence echo restarted the track in a loop.
-        if (ytPlayer && ytPlayerReady && ytLoadedId === t.ytId) {
-          if (SP.playing) { try { ytPlayer.playVideo(); } catch(e){} }
-          else { try { ytPlayer.pauseVideo(); } catch(e){} }
-        } else {
-          playViaYouTubeIframe(t.ytId, SP.playing);
-        }
-      }
       else if (t.ytId) loadYouTubeTrack(t.ytId, SP.playing);
     }
-    if (S.call) { updateCarousel(); updateDynamicBackground(t); updateDock(); }
+    alignMusicPlayback();
+    updateCarousel(); updateDynamicBackground(t); updateDock();
   }
 
   /* ---------- THE MAIN PLAYBACK FUNCTION with fast-path ---------- */
@@ -3689,12 +3750,16 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   function setTrack(ni, opts) {
     opts = opts || {};
     if (!SP.queue.length || !SP.on) return;
+    if (opts.auto && SP.hostId !== S.user.id) return;
+    musicSyncState = null;
     if (!opts.auto && !canControl()) { toast("The host is controlling playback.", "err"); return; }
     const len = SP.queue.length;
     ni = ((ni % len) + len) % len;
     if (ni === SP.index && !opts.force) return;
     ensureHost();
-    SP.index = ni; SP.pos = 0;
+    SP.index = ni; SP.pos = 0; SP.playing = true;
+    pauseAudio(); pauseSoundCloud();
+    if (ytPlayer && ytPlayerReady) ytPlayer.pauseVideo();
     const t = curTrack();
     if (t && t.source === "audio" && t.url) playAudioTrack(t, true);
     else if (t && t.source === "sc" && t.scUrl) loadSoundCloudTrack(t, true);
@@ -3708,6 +3773,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   function nextTrack(opts) { setTrack(SP.index + 1, opts); }
   function prevTrack() { setTrack(SP.index - 1, {}); }
   function togglePlay() {
+    musicSyncState = null;
     if (!SP.on) return;
     if (!canControl()) { toast("The host is controlling playback.", "err"); return; }
     const t = curTrack();
@@ -3806,6 +3872,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     } else {
       if (SP.playing) SP.pos += 250;
     }
+    if (SP.hostId === S.user.id && Date.now() - musicLastPush > 5000) pushMusic();
     refreshProgress();
   }
 
@@ -4369,9 +4436,17 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   /* ---------- listening-session invites ---------- */
   function broadcastMusicInvite() {
     const c = S.call;
-    if (!c || !supabaseClient) return;
+    if (!c || !supabaseClient || SP.hostId !== S.user.id || !SP.on || !validMusicSession(SP, c.guildId, true)) return;
+    const t = curTrack();
+    const audible = t.source === "audio" ? audioEl && !audioEl.paused && audioReady
+      : t.source === "sc" ? scActuallyPlaying
+      : ytPlayer && ytPlayerReady && ytLoadedId === t.ytId && ytPlayer.getPlayerState() === 1;
+    if (!audible) return;
+    const key = SP.hostId + ":" + (t.id || t.ytId || t.scUrl || t.url);
+    if (musicInviteKey === key) return;
     const ch = getChannel(c.guildId);
     if (!ch) return;
+    musicInviteKey = key;
     try {
       ch.send({ type: "broadcast", event: "music_invite", payload: {
         from: S.user.id, guildId: c.guildId,
@@ -4383,12 +4458,14 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     p = broadcastPayload(p);
     if (!p || !p.from || p.from === S.user.id) return;
     if (!S.call || S.call.guildId !== gid) return;   // invites only count inside the call
-    if (SP.on) return;                               // already listening
+    if (SP.on || !validMusicSession(p.music, gid, true) || p.music.hostId !== p.from) return;
+    S.callMusic = p.music;
     const roster = (guilds()[gid] || {}).roster || {};
     showMusicInviteToast(displayName(p.from, (roster[p.from] || {}).name), p.music);
   }
   const musicInviteState = { shownAt: 0 };
   function showMusicInviteToast(hostName, musicState) {
+    if (!S.call || !validMusicSession(musicState, S.call.guildId, true)) return;
     const root = byId("toasts");
     if (!root) return;
     const now = Date.now();
@@ -4415,9 +4492,8 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
      music mode on (startSpotify adopts queue + index from S.callMusic). */
   function joinMusicSession(musicState) {
     if (!S.call || SP.on) return;
-    const m = musicState && typeof musicState === "object" && Array.isArray(musicState.queue) && musicState.queue.length
-      ? musicState
-      : (S.callMusic && Array.isArray(S.callMusic.queue) && S.callMusic.queue.length ? S.callMusic : null);
+    const m = S.callMusic;
+    if (!validMusicSession(m, S.call.guildId, true)) return;
     if (m) {
       S.callMusic = m;
       if (m.hostId) SP.hostId = m.hostId;   // the session host stays in charge
@@ -4440,7 +4516,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
       if (!c || SP.on) return;
       const snap = ROSTER_MIRROR[c.guildId] || {};
       const m = snap._music && typeof snap._music === "object" && Array.isArray(snap._music.queue) && snap._music.queue.length ? snap._music : null;
-      if (!m || !m.hostId || m.hostId === S.user.id) return;
+      if (!validMusicSession(m, c.guildId, true) || m.hostId === S.user.id) return;
       const roster = (guilds()[c.guildId] || {}).roster || {};
       showMusicInviteToast(displayName(m.hostId, (roster[m.hostId] || {}).name), m);
     }, delay);
@@ -4453,21 +4529,23 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     if (!S.call) return toast("Join a call first to start collaborative music.", "err");
     if (SP.on) return;
     // If we have a fresh music snapshot from call presence, adopt its queue.
-    if (S.callMusic && Array.isArray(S.callMusic.queue) && S.callMusic.queue.length) {
+    const joining = validMusicSession(S.callMusic, S.call.guildId, true) ? S.callMusic : null;
+    if (joining) {
       SP.queue = S.callMusic.queue;
       SP.index = Math.max(0, Math.min(S.callMusic.index || 0, SP.queue.length - 1));
       S.callMusic.queue.forEach(t => { TRACK_INDEX[t.id] = t; });
     }
     SP.on = true;
     if (!(SP.index >= 0 && SP.index < SP.queue.length)) SP.index = 0;
-    ensureHost();
+    SP.hostId = joining ? joining.hostId : S.user.id;
     const t = curTrack();
-    if (t && t.source === "audio" && t.url) playAudioTrack(t, SP.playing);
+    if (joining) applySpotifySync(joining, true);
+    else if (t && t.source === "audio" && t.url) playAudioTrack(t, SP.playing);
     else if (t && t.source === "sc" && t.scUrl) loadSoundCloudTrack(t, SP.playing);
     else if (t && t.source === "ytiframe" && t.ytId) playViaYouTubeIframe(t.ytId, SP.playing);
     else if (t && t.ytId) loadYouTubeTrack(t.ytId, true);
     if (!SP.tickI) SP.tickI = setInterval(tickSpotify, 250);
-    syncSpotify();
+    if (!joining) syncSpotify();
     updateStage();
     updateCtl();
     broadcastMusicInvite();
@@ -4475,6 +4553,11 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
   }
 
   function stopSpotify() {
+    if (S.call && SP.hostId === S.user.id) {
+      writePresence(S.call.guildId, { _music: null });
+      S.callMusic = null;
+    }
+    musicSyncState = null; musicSyncKey = ""; musicInviteKey = "";
     if (SP.tickI) { clearInterval(SP.tickI); SP.tickI = null; }
     pauseAudio();
     if (audioEl) { audioEl.pause(); try { audioEl.removeAttribute("src"); audioEl.load(); } catch (e) {} }
@@ -4485,7 +4568,7 @@ body.in-call #toasts { bottom: 92px; }   /* clear the call control bar */
     scWidgetReady = false;
     const wasOn = SP.on;
     SP.on = false; SP.playing = false; SP.openPanel = null;
-    if (wasOn) { syncSpotify(); updateCtl(); if (S.call) updateStage(); }
+    if (wasOn) { updateCtl(); if (S.call) updateStage(); }
   }
 
   function toggleSpotify() {
